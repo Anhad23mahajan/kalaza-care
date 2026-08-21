@@ -1,0 +1,757 @@
+package com.kalazacare.app.data.repository
+
+import com.kalazacare.app.data.model.*
+import io.github.jan.supabase.SupabaseClient
+import io.github.jan.supabase.postgrest.postgrest
+import kotlinx.serialization.EncodeDefault
+import kotlinx.serialization.ExperimentalSerializationApi
+import kotlinx.serialization.SerialName
+import kotlinx.serialization.Serializable
+import java.time.LocalDate
+import java.time.LocalDateTime
+import java.time.LocalTime
+import java.time.OffsetDateTime
+import java.util.UUID
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Shared string <-> java.time helpers. PostgREST hands back plain JSON strings
+// for date/time/timestamptz columns, so every row here is decoded into a DTO
+// with String fields first, then converted by hand — the same shape as the
+// old Firestore field-map parsing, just typed via kotlinx.serialization DTOs.
+// ─────────────────────────────────────────────────────────────────────────────
+
+private fun parseDate(s: String): LocalDate = runCatching { LocalDate.parse(s) }.getOrDefault(LocalDate.now())
+private fun parseDateOrNull(s: String?): LocalDate? = s?.let { runCatching { LocalDate.parse(it) }.getOrNull() }
+private fun parseTime(s: String): LocalTime = runCatching { LocalTime.parse(s) }.getOrDefault(LocalTime.now())
+private fun parseTimestamp(s: String): LocalDateTime = runCatching { OffsetDateTime.parse(s).toLocalDateTime() }
+    .recoverCatching { LocalDateTime.parse(s) }.getOrDefault(LocalDateTime.now())
+private fun parseTimestampOrNull(s: String?): LocalDateTime? = s?.let { str ->
+    runCatching { OffsetDateTime.parse(str).toLocalDateTime() }.recoverCatching { LocalDateTime.parse(str) }.getOrNull()
+}
+private fun newId() = UUID.randomUUID().toString()
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Patients
+// ─────────────────────────────────────────────────────────────────────────────
+
+@OptIn(ExperimentalSerializationApi::class)
+@Serializable
+private data class PatientRow(
+    val id: String,
+    val name: String = "",
+    val age: Int = 0,
+    // @EncodeDefault(ALWAYS) on gender/isArchived — same encodeDefaults=false
+    // gap that already caused the missing `tag`/`recurring_days` bugs
+    // (see MedicationRow): a value that happens to match the Kotlin default
+    // gets silently dropped from the update payload instead of being sent,
+    // so e.g. editing a Male patient's Room No without touching Gender is
+    // harmless, but explicitly changing Gender back to Male, or unarchiving
+    // straight through a general update, would silently no-op.
+    @EncodeDefault(EncodeDefault.Mode.ALWAYS)
+    val gender: String = "MALE",
+    @SerialName("room_no") val roomNo: String = "",
+    @SerialName("medical_history") val medicalHistory: String = "",
+    @SerialName("current_issues") val currentIssues: String = "",
+    val allergies: String = "",
+    @SerialName("emergency_contact") val emergencyContact: String = "",
+    @SerialName("emergency_phone") val emergencyPhone: String = "",
+    @SerialName("admission_date") val admissionDate: String = LocalDate.now().toString(),
+    @SerialName("is_archived")
+    @EncodeDefault(EncodeDefault.Mode.ALWAYS)
+    val isArchived: Boolean = false,
+    @SerialName("primary_diagnosis") val primaryDiagnosis: String = "",
+)
+
+private fun PatientRow.toDomain() = Patient(
+    id = id, name = name, age = age,
+    gender = runCatching { Gender.valueOf(gender) }.getOrDefault(Gender.MALE),
+    roomNo = roomNo, medicalHistory = medicalHistory, currentIssues = currentIssues, allergies = allergies,
+    emergencyContact = emergencyContact, emergencyPhone = emergencyPhone,
+    admissionDate = parseDate(admissionDate), isArchived = isArchived, primaryDiagnosis = primaryDiagnosis,
+)
+private fun Patient.toRow() = PatientRow(
+    id = id, name = name, age = age, gender = gender.name, roomNo = roomNo, medicalHistory = medicalHistory,
+    currentIssues = currentIssues, allergies = allergies, emergencyContact = emergencyContact,
+    emergencyPhone = emergencyPhone, admissionDate = admissionDate.toString(), isArchived = isArchived,
+    primaryDiagnosis = primaryDiagnosis,
+)
+
+class SupabasePatientRepository(private val client: SupabaseClient) : PatientRepository {
+    private val table = "patients"
+    override suspend fun getAllPatients(includeArchived: Boolean): List<Patient> {
+        val all = client.postgrest.from(table).select().decodeList<PatientRow>().map { it.toDomain() }
+        return (if (includeArchived) all else all.filter { !it.isArchived }).sortedBy { it.name }
+    }
+    override suspend fun getPatientById(id: String): Patient? =
+        client.postgrest.from(table).select { filter { eq("id", id) } }
+            .decodeSingleOrNull<PatientRow>()?.toDomain()
+    override suspend fun addPatient(patient: Patient): Patient {
+        val saved = patient.copy(id = newId())
+        client.postgrest.from(table).insert(saved.toRow())
+        return saved
+    }
+    override suspend fun updatePatient(patient: Patient) {
+        client.postgrest.from(table).update(patient.toRow()) { filter { eq("id", patient.id) } }
+    }
+    override suspend fun archivePatient(id: String) {
+        client.postgrest.from(table).update(mapOf("is_archived" to true)) { filter { eq("id", id) } }
+    }
+    override suspend fun unarchivePatient(id: String) {
+        client.postgrest.from(table).update(mapOf("is_archived" to false)) { filter { eq("id", id) } }
+    }
+    override suspend fun searchPatients(query: String, includeArchived: Boolean): List<Patient> =
+        getAllPatients(includeArchived).filter {
+            it.name.contains(query, ignoreCase = true) || it.roomNo.contains(query, ignoreCase = true)
+        }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Vitals
+// ─────────────────────────────────────────────────────────────────────────────
+
+@Serializable
+private data class VitalRow(
+    val id: String,
+    @SerialName("patient_id") val patientId: String,
+    val date: String = LocalDate.now().toString(),
+    val time: String = LocalTime.now().toString(),
+    val pulse: String = "", val bp: String = "", val spo2: String = "", val temperature: String = "",
+    @SerialName("sugar_fasting") val sugarFasting: String = "",
+    @SerialName("sugar_pp") val sugarPP: String = "",
+    @SerialName("signed_by") val signedBy: String = "",
+)
+private fun VitalRow.toDomain() = VitalRecord(
+    id = id, patientId = patientId, date = parseDate(date), time = parseTime(time),
+    pulse = pulse, bp = bp, spo2 = spo2, temperature = temperature,
+    sugarFasting = sugarFasting, sugarPP = sugarPP, signedBy = signedBy,
+)
+private fun VitalRecord.toRow() = VitalRow(
+    id = id, patientId = patientId, date = date.toString(), time = time.toString(),
+    pulse = pulse, bp = bp, spo2 = spo2, temperature = temperature,
+    sugarFasting = sugarFasting, sugarPP = sugarPP, signedBy = signedBy,
+)
+
+class SupabaseVitalsRepository(private val client: SupabaseClient) : VitalsRepository {
+    private val table = "vitals"
+    override suspend fun getVitalsForPatient(patientId: String): List<VitalRecord> =
+        client.postgrest.from(table).select { filter { eq("patient_id", patientId) } }
+            .decodeList<VitalRow>().map { it.toDomain() }.sortedByDescending { it.date }
+    override suspend fun getVitalsForDate(date: LocalDate): List<VitalRecord> =
+        client.postgrest.from(table).select { filter { eq("date", date.toString()) } }
+            .decodeList<VitalRow>().map { it.toDomain() }
+    override suspend fun getVitalById(id: String): VitalRecord? =
+        client.postgrest.from(table).select { filter { eq("id", id) } }.decodeSingleOrNull<VitalRow>()?.toDomain()
+    override suspend fun addVital(record: VitalRecord) {
+        client.postgrest.from(table).insert(record.copy(id = newId()).toRow())
+    }
+    override suspend fun updateVital(record: VitalRecord) {
+        client.postgrest.from(table).update(record.toRow()) { filter { eq("id", record.id) } }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Medication (MAR)
+// ─────────────────────────────────────────────────────────────────────────────
+
+@OptIn(ExperimentalSerializationApi::class)
+@Serializable
+private data class MedicationRow(
+    val id: String,
+    @SerialName("patient_id") val patientId: String,
+    @SerialName("medicine_name") val medicineName: String = "",
+    val dose: String = "", val quantity: String = "",
+    @SerialName("schedule_time") val scheduleTime: String = LocalTime.now().toString(),
+    // supabase-kt's Json encoder has encodeDefaults=false baked in with no
+    // override — a value equal to its Kotlin default (e.g. a fresh "MORNING"
+    // tag) is silently dropped from the request instead of sent, which for
+    // this NOT NULL column meant a 23502 on insert and a no-op on update.
+    // @EncodeDefault(ALWAYS) forces it into every request regardless.
+    @EncodeDefault(EncodeDefault.Mode.ALWAYS)
+    val tag: String = "MORNING",
+    @SerialName("scheduled_date") val scheduledDate: String = LocalDate.now().toString(),
+    @SerialName("is_recurring") val isRecurring: Boolean = true,
+    // Comma-separated ISO day-of-week numbers (1=Mon..7=Sun), e.g. "1,3,5".
+    // Empty/blank means every day -- see MedicationEntry.recurringDays.
+    // @EncodeDefault(ALWAYS) for the same reason as [tag] above -- clearing
+    // a dose back to "every day" (recurringDays = "") matches this field's
+    // Kotlin default and would otherwise get silently dropped from an edit's
+    // PATCH request, leaving the old weekday restriction in place server-side.
+    @EncodeDefault(EncodeDefault.Mode.ALWAYS)
+    @SerialName("recurring_days") val recurringDays: String = "",
+    val status: String = "PENDING",
+    @SerialName("administered_by") val administeredBy: String = "",
+    @SerialName("administered_at") val administeredAt: String? = null,
+    val notes: String = "",
+    @SerialName("allotment_status") val allotmentStatus: String = "NOT_ALLOTTED",
+    @SerialName("allotted_by_id") val allottedById: String? = null,
+    @SerialName("allotted_by_name") val allottedByName: String = "",
+    @SerialName("allotted_at") val allottedAt: String? = null,
+    @SerialName("allotment_scanned_code") val allotmentScannedCode: String = "",
+    @SerialName("administered_scanned_code") val administeredScannedCode: String = "",
+)
+private fun MedicationRow.toDomain(): MedicationEntry {
+    val entry = MedicationEntry(
+        id = id, patientId = patientId, medicineName = medicineName, dose = dose, quantity = quantity,
+        scheduleTime = parseTime(scheduleTime),
+        tag = runCatching { DoseTag.valueOf(tag) }.getOrDefault(DoseTag.MORNING),
+        scheduledDate = parseDate(scheduledDate), isRecurring = isRecurring,
+        recurringDays = recurringDays.split(",").mapNotNull { it.trim().toIntOrNull() }.toSet(),
+        status = runCatching { MedStatus.valueOf(status) }.getOrDefault(MedStatus.PENDING),
+        administeredBy = administeredBy, administeredAt = parseTimestampOrNull(administeredAt), notes = notes,
+        allotmentStatus = runCatching { AllotmentStatus.valueOf(allotmentStatus) }.getOrDefault(AllotmentStatus.NOT_ALLOTTED),
+        allottedById = allottedById ?: "", allottedByName = allottedByName,
+        allottedAt = parseTimestampOrNull(allottedAt), allotmentScannedCode = allotmentScannedCode,
+        administeredScannedCode = administeredScannedCode,
+    )
+    return entry.withComputedStatus()
+}
+private fun MedicationEntry.toRow() = MedicationRow(
+    id = id, patientId = patientId, medicineName = medicineName, dose = dose, quantity = quantity,
+    scheduleTime = scheduleTime.toString(), tag = tag.name,
+    scheduledDate = scheduledDate.toString(), isRecurring = isRecurring,
+    recurringDays = recurringDays.sorted().joinToString(","), status = status.name,
+    administeredBy = administeredBy, administeredAt = administeredAt?.toString(), notes = notes,
+    allotmentStatus = allotmentStatus.name, allottedById = allottedById.ifBlank { null }, allottedByName = allottedByName,
+    allottedAt = allottedAt?.toString(), allotmentScannedCode = allotmentScannedCode,
+    administeredScannedCode = administeredScannedCode,
+)
+
+/**
+ * PENDING/OVERDUE is a live-computed view of the schedule, not a persisted fact —
+ * recomputed on every read so editing a dose's time (e.g. moving it later)
+ * un-overdues it instead of leaving it stuck OVERDUE forever. For a recurring
+ * dose, [scheduledDate] is stale the moment a day passes, so "due today" is
+ * judged against today's date instead — only a one-off dose is checked
+ * against its own stored date.
+ *
+ * A *recurring* dose that was ALLOTTED/ADMINISTERED also resets back to a
+ * fresh PENDING/OVERDUE view once its allotted/administered day has passed —
+ * otherwise "given yesterday" would incorrectly suppress today's occurrence
+ * forever. This reset is display-time only (nothing is written back), and it
+ * doesn't lose history: the permanent compliance record lives in
+ * `medication_evidence_log` (see [MedicationEvidenceEvent]), not in these
+ * flat columns.
+ */
+private fun MedicationEntry.withComputedStatus(): MedicationEntry {
+    var e = this
+    if (e.isRecurring) {
+        if (e.status == MedStatus.ADMINISTERED && e.administeredAt?.toLocalDate() != LocalDate.now()) {
+            e = e.copy(
+                status = MedStatus.PENDING, administeredBy = "", administeredAt = null,
+                administeredScannedCode = "",
+            )
+        }
+        if (e.allotmentStatus == AllotmentStatus.ALLOTTED && e.allottedAt?.toLocalDate() != LocalDate.now()) {
+            e = e.copy(
+                allotmentStatus = AllotmentStatus.NOT_ALLOTTED, allottedById = "", allottedByName = "",
+                allottedAt = null, allotmentScannedCode = "",
+            )
+        }
+    }
+    if (e.status != MedStatus.PENDING && e.status != MedStatus.OVERDUE) return e
+    val effectiveDate = if (e.isRecurring) LocalDate.now() else e.scheduledDate
+    val scheduledAt = LocalDateTime.of(effectiveDate, e.scheduleTime)
+    val computed = if (scheduledAt.isBefore(LocalDateTime.now())) MedStatus.OVERDUE else MedStatus.PENDING
+    return if (computed != e.status) e.copy(status = computed) else e
+}
+
+/**
+ * Whether this entry is actually due on [date] — a one-off dose only matches its own
+ * [MedicationEntry.scheduledDate] (already guaranteed by the query that fetched it), while a
+ * recurring dose is due every day unless [MedicationEntry.recurringDays] narrows it to specific
+ * weekdays (1=Mon..7=Sun, matching [LocalDate.getDayOfWeek]'s ISO value).
+ */
+private fun MedicationEntry.isDueOn(date: LocalDate): Boolean =
+    !isRecurring || recurringDays.isEmpty() || date.dayOfWeek.value in recurringDays
+
+class SupabaseMedicationRepository(private val client: SupabaseClient) : MedicationRepository {
+    private val table = "medications"
+
+    // A recurring dose is due every day regardless of its stored date; a one-off dose is
+    // due only on that date -- filtered in the query itself (is_recurring = true OR
+    // scheduled_date = date) instead of pulling every medication row and filtering on-device.
+    // A recurring dose restricted to specific weekdays (recurringDays non-empty) still comes
+    // back from that broad query on every day, so it's narrowed further client-side below --
+    // doing that in Postgrest itself would mean parsing the recurring_days CSV column server-side.
+    override suspend fun getMedicationsForPatient(patientId: String, date: LocalDate): List<MedicationEntry> =
+        client.postgrest.from(table).select {
+            filter {
+                eq("patient_id", patientId)
+                or {
+                    eq("is_recurring", true)
+                    eq("scheduled_date", date.toString())
+                }
+            }
+        }.decodeList<MedicationRow>().map { it.toDomain() }.filter { it.isDueOn(date) }.sortedBy { it.scheduleTime }
+    override suspend fun getMedicationsForPatient(patientId: String): List<MedicationEntry> =
+        client.postgrest.from(table).select { filter { eq("patient_id", patientId) } }
+            .decodeList<MedicationRow>().map { it.toDomain() }.sortedBy { it.scheduleTime }
+    override suspend fun getMedicationsForPatientAndTag(patientId: String, tag: DoseTag, date: LocalDate): List<MedicationEntry> =
+        getMedicationsForPatient(patientId, date).filter { it.tag == tag }
+    override suspend fun getMedicationsForDate(date: LocalDate): List<MedicationEntry> =
+        client.postgrest.from(table).select {
+            filter {
+                or {
+                    eq("is_recurring", true)
+                    eq("scheduled_date", date.toString())
+                }
+            }
+        }.decodeList<MedicationRow>().map { it.toDomain() }.filter { it.isDueOn(date) }.sortedBy { it.scheduleTime }
+    override suspend fun getMedicationById(id: String): MedicationEntry? =
+        client.postgrest.from(table).select { filter { eq("id", id) } }.decodeSingleOrNull<MedicationRow>()?.toDomain()
+    override suspend fun addMedication(entry: MedicationEntry) {
+        client.postgrest.from(table).insert(entry.copy(id = newId()).toRow())
+    }
+    override suspend fun updateMedication(entry: MedicationEntry) {
+        client.postgrest.from(table).update(entry.toRow()) { filter { eq("id", entry.id) } }
+    }
+    override suspend fun deleteMedication(id: String) {
+        client.postgrest.from(table).delete { filter { eq("id", id) } }
+    }
+    override suspend fun markAdministered(id: String, staffName: String, scannedCode: String) {
+        val med = client.postgrest.from(table).select { filter { eq("id", id) } }.decodeSingleOrNull<MedicationRow>()
+        client.postgrest.from(table).update(
+            mapOf(
+                "status" to MedStatus.ADMINISTERED.name,
+                "administered_by" to staffName,
+                "administered_at" to LocalDateTime.now().toString(),
+                "administered_scanned_code" to scannedCode,
+            )
+        ) { filter { eq("id", id) } }
+        if (med != null) {
+            client.postgrest.from(EVIDENCE_LOG_TABLE).insert(
+                MedicationEvidenceRow(
+                    id = newId(), medicationId = id, patientId = med.patientId, medicineName = med.medicineName,
+                    kind = "ADMINISTRATION", staffId = null, staffName = staffName,
+                    scannedCode = scannedCode, occurredAt = LocalDateTime.now().toString(),
+                )
+            )
+        }
+    }
+    override suspend fun allotMedication(id: String, staffId: String, staffName: String, scannedCode: String) {
+        val med = client.postgrest.from(table).select { filter { eq("id", id) } }.decodeSingleOrNull<MedicationRow>()
+        client.postgrest.from(table).update(
+            mapOf(
+                "allotment_status" to AllotmentStatus.ALLOTTED.name,
+                "allotted_by_id" to staffId,
+                "allotted_by_name" to staffName,
+                "allotted_at" to LocalDateTime.now().toString(),
+                "allotment_scanned_code" to scannedCode,
+            )
+        ) { filter { eq("id", id) } }
+        if (med != null) {
+            client.postgrest.from(EVIDENCE_LOG_TABLE).insert(
+                MedicationEvidenceRow(
+                    id = newId(), medicationId = id, patientId = med.patientId, medicineName = med.medicineName,
+                    kind = "ALLOTMENT", staffId = staffId, staffName = staffName,
+                    scannedCode = scannedCode, occurredAt = LocalDateTime.now().toString(),
+                )
+            )
+        }
+    }
+    override suspend fun getEvidenceLog(): List<MedicationEvidenceEvent> =
+        client.postgrest.from(EVIDENCE_LOG_TABLE).select().decodeList<MedicationEvidenceRow>()
+            .map { it.toDomain() }.sortedByDescending { it.occurredAt }
+}
+
+private const val EVIDENCE_LOG_TABLE = "medication_evidence_log"
+
+@Serializable
+private data class MedicationEvidenceRow(
+    val id: String,
+    @SerialName("medication_id") val medicationId: String,
+    @SerialName("patient_id") val patientId: String,
+    @SerialName("medicine_name") val medicineName: String = "",
+    val kind: String = "",
+    @SerialName("staff_id") val staffId: String? = null,
+    @SerialName("staff_name") val staffName: String = "",
+    @SerialName("scanned_code") val scannedCode: String = "",
+    @SerialName("occurred_at") val occurredAt: String = LocalDateTime.now().toString(),
+)
+private fun MedicationEvidenceRow.toDomain() = MedicationEvidenceEvent(
+    id = id, medicationId = medicationId, patientId = patientId, medicineName = medicineName,
+    kind = kind, staffId = staffId ?: "", staffName = staffName, scannedCode = scannedCode,
+    occurredAt = parseTimestamp(occurredAt),
+)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Utility Records & Items
+// ─────────────────────────────────────────────────────────────────────────────
+
+@Serializable
+private data class UtilityRecordRow(
+    val id: String,
+    @SerialName("patient_id") val patientId: String,
+    val date: String = LocalDate.now().toString(),
+    val time: String = LocalTime.now().toString(),
+    val quantities: Map<String, Int> = emptyMap(),
+    @SerialName("issued_to_caregiver") val issuedToCaregiver: String = "",
+    @SerialName("issued_by_supervisor") val issuedBySupervisor: String = "",
+    @SerialName("checked_by") val checkedBy: String = "",
+)
+private fun UtilityRecordRow.toDomain() = UtilityRecord(
+    id = id, patientId = patientId, date = parseDate(date), time = parseTime(time), quantities = quantities,
+    issuedToCaregiver = issuedToCaregiver, issuedBySupervisor = issuedBySupervisor, checkedBy = checkedBy,
+)
+private fun UtilityRecord.toRow() = UtilityRecordRow(
+    id = id, patientId = patientId, date = date.toString(), time = time.toString(), quantities = quantities,
+    issuedToCaregiver = issuedToCaregiver, issuedBySupervisor = issuedBySupervisor, checkedBy = checkedBy,
+)
+
+@Serializable
+private data class UtilityItemRow(
+    val id: String, val name: String = "", val unit: String = "pcs",
+    @SerialName("display_order") val displayOrder: Int = 0,
+    @SerialName("is_active") val isActive: Boolean = true,
+)
+private fun UtilityItemRow.toDomain() = UtilityItem(id = id, name = name, unit = unit, displayOrder = displayOrder, isActive = isActive)
+private fun UtilityItem.toRow() = UtilityItemRow(id = id, name = name, unit = unit, displayOrder = displayOrder, isActive = isActive)
+
+class SupabaseUtilityRepository(private val client: SupabaseClient) : UtilityRepository {
+    private val recordsTable = "utility_records"
+    private val itemsTable = "utility_items"
+    override suspend fun getUtilityForPatient(patientId: String): List<UtilityRecord> =
+        client.postgrest.from(recordsTable).select { filter { eq("patient_id", patientId) } }
+            .decodeList<UtilityRecordRow>().map { it.toDomain() }.sortedByDescending { it.date }
+    override suspend fun getUtilityForDate(date: LocalDate): List<UtilityRecord> =
+        client.postgrest.from(recordsTable).select { filter { eq("date", date.toString()) } }
+            .decodeList<UtilityRecordRow>().map { it.toDomain() }
+    override suspend fun getUtilityRecordById(id: String): UtilityRecord? =
+        client.postgrest.from(recordsTable).select { filter { eq("id", id) } }
+            .decodeSingleOrNull<UtilityRecordRow>()?.toDomain()
+    override suspend fun addUtilityRecord(record: UtilityRecord) {
+        client.postgrest.from(recordsTable).insert(record.copy(id = newId()).toRow())
+    }
+    override suspend fun updateUtilityRecord(record: UtilityRecord) {
+        client.postgrest.from(recordsTable).update(record.toRow()) { filter { eq("id", record.id) } }
+    }
+    override suspend fun getUtilityItems(): List<UtilityItem> = getAllUtilityItems().filter { it.isActive }
+    override suspend fun getAllUtilityItems(): List<UtilityItem> =
+        client.postgrest.from(itemsTable).select().decodeList<UtilityItemRow>()
+            .map { it.toDomain() }.sortedBy { it.displayOrder }
+    override suspend fun addUtilityItem(item: UtilityItem) {
+        client.postgrest.from(itemsTable).insert(item.copy(id = newId()).toRow())
+    }
+    override suspend fun updateUtilityItem(item: UtilityItem) {
+        client.postgrest.from(itemsTable).update(item.toRow()) { filter { eq("id", item.id) } }
+    }
+    override suspend fun deleteUtilityItem(id: String) {
+        client.postgrest.from(itemsTable).update(mapOf("is_active" to false)) { filter { eq("id", id) } }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Doctor Visits & Care Notes
+// ─────────────────────────────────────────────────────────────────────────────
+
+@Serializable
+private data class DoctorVisitRow(
+    val id: String,
+    @SerialName("patient_id") val patientId: String,
+    @SerialName("doctor_name") val doctorName: String = "",
+    val specialty: String = "",
+    val date: String = LocalDate.now().toString(),
+    val time: String = LocalTime.now().toString(),
+    val notes: String = "",
+    @SerialName("next_visit_date") val nextVisitDate: String? = null,
+    @SerialName("prescription_changes") val prescriptionChanges: String = "",
+    @SerialName("is_confirmed") val isConfirmed: Boolean = false,
+    @SerialName("is_archived") val isArchived: Boolean = false,
+)
+private fun DoctorVisitRow.toDomain() = DoctorVisit(
+    id = id, patientId = patientId, doctorName = doctorName, specialty = specialty,
+    date = parseDate(date), time = parseTime(time), notes = notes,
+    nextVisitDate = parseDateOrNull(nextVisitDate), prescriptionChanges = prescriptionChanges,
+    isConfirmed = isConfirmed, isArchived = isArchived,
+)
+private fun DoctorVisit.toRow() = DoctorVisitRow(
+    id = id, patientId = patientId, doctorName = doctorName, specialty = specialty,
+    date = date.toString(), time = time.toString(), notes = notes,
+    nextVisitDate = nextVisitDate?.toString(), prescriptionChanges = prescriptionChanges,
+    isConfirmed = isConfirmed, isArchived = isArchived,
+)
+
+class SupabaseDoctorVisitRepository(private val client: SupabaseClient) : DoctorVisitRepository {
+    private val table = "doctor_visits"
+    override suspend fun getVisitsForPatient(patientId: String): List<DoctorVisit> =
+        client.postgrest.from(table).select { filter { eq("patient_id", patientId) } }
+            .decodeList<DoctorVisitRow>().map { it.toDomain() }.sortedByDescending { it.date }
+    override suspend fun getVisitsForDate(date: LocalDate): List<DoctorVisit> =
+        client.postgrest.from(table).select { filter { eq("date", date.toString()) } }
+            .decodeList<DoctorVisitRow>().map { it.toDomain() }
+    override suspend fun getVisitById(id: String): DoctorVisit? =
+        client.postgrest.from(table).select { filter { eq("id", id) } }.decodeSingleOrNull<DoctorVisitRow>()?.toDomain()
+    override suspend fun addVisit(visit: DoctorVisit) {
+        client.postgrest.from(table).insert(visit.copy(id = newId()).toRow())
+    }
+    override suspend fun updateVisit(visit: DoctorVisit) {
+        client.postgrest.from(table).update(visit.toRow()) { filter { eq("id", visit.id) } }
+    }
+    override suspend fun deleteVisit(id: String) {
+        client.postgrest.from(table).delete { filter { eq("id", id) } }
+    }
+}
+
+@Serializable
+private data class CareNoteRow(
+    val id: String,
+    @SerialName("patient_id") val patientId: String,
+    @SerialName("staff_id") val staffId: String? = null,
+    @SerialName("staff_name") val staffName: String = "",
+    val timestamp: String = LocalDateTime.now().toString(),
+    val note: String = "",
+)
+private fun CareNoteRow.toDomain() = CareNote(
+    id = id, patientId = patientId, staffId = staffId ?: "", staffName = staffName,
+    timestamp = parseTimestamp(timestamp), note = note,
+)
+private fun CareNote.toRow() = CareNoteRow(
+    id = id, patientId = patientId, staffId = staffId.ifBlank { null }, staffName = staffName,
+    timestamp = timestamp.toString(), note = note,
+)
+
+class SupabaseCareNoteRepository(private val client: SupabaseClient) : CareNoteRepository {
+    private val table = "care_notes"
+    override suspend fun getNotesForPatient(patientId: String): List<CareNote> =
+        client.postgrest.from(table).select { filter { eq("patient_id", patientId) } }
+            .decodeList<CareNoteRow>().map { it.toDomain() }.sortedByDescending { it.timestamp }
+    override suspend fun addNote(note: CareNote) {
+        client.postgrest.from(table).insert(note.copy(id = newId()).toRow())
+    }
+    override suspend fun updateNote(note: CareNote) {
+        client.postgrest.from(table).update(note.toRow()) { filter { eq("id", note.id) } }
+    }
+    override suspend fun getNoteById(id: String): CareNote? =
+        client.postgrest.from(table).select { filter { eq("id", id) } }.decodeSingleOrNull<CareNoteRow>()?.toDomain()
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Approval Queue
+// ─────────────────────────────────────────────────────────────────────────────
+
+@Serializable
+private data class ApprovalRequestRow(
+    val id: String,
+    @SerialName("entity_type") val entityType: String = "PATIENT",
+    @SerialName("entity_id") val entityId: String = "",
+    val action: String = "EDIT",
+    @SerialName("patient_id") val patientId: String? = null,
+    @SerialName("patient_name") val patientName: String = "",
+    @SerialName("requested_by_id") val requestedById: String? = null,
+    @SerialName("requested_by_name") val requestedByName: String = "",
+    @SerialName("field_changed") val fieldChanged: String = "",
+    @SerialName("old_value") val oldValue: String = "",
+    @SerialName("new_value") val newValue: String = "",
+    val status: String = "PENDING",
+    @SerialName("reviewed_by_id") val reviewedById: String? = null,
+    @SerialName("reviewed_by_name") val reviewedByName: String = "",
+    val timestamp: String = LocalDateTime.now().toString(),
+    @SerialName("reviewed_at") val reviewedAt: String? = null,
+    @SerialName("rejection_reason") val rejectionReason: String = "",
+)
+private fun ApprovalRequestRow.toDomain() = ApprovalRequest(
+    id = id, entityType = runCatching { ApprovalEntityType.valueOf(entityType) }.getOrDefault(ApprovalEntityType.PATIENT),
+    entityId = entityId, action = runCatching { ApprovalAction.valueOf(action) }.getOrDefault(ApprovalAction.EDIT),
+    patientId = patientId ?: "", patientName = patientName, requestedById = requestedById ?: "",
+    requestedByName = requestedByName, fieldChanged = fieldChanged, oldValue = oldValue, newValue = newValue,
+    status = runCatching { ApprovalStatus.valueOf(status) }.getOrDefault(ApprovalStatus.PENDING),
+    reviewedById = reviewedById ?: "", reviewedByName = reviewedByName, timestamp = parseTimestamp(timestamp),
+    reviewedAt = parseTimestampOrNull(reviewedAt), rejectionReason = rejectionReason,
+)
+private fun ApprovalRequest.toRow() = ApprovalRequestRow(
+    id = id, entityType = entityType.name, entityId = entityId, action = action.name,
+    patientId = patientId.ifBlank { null }, patientName = patientName, requestedById = requestedById.ifBlank { null },
+    requestedByName = requestedByName, fieldChanged = fieldChanged, oldValue = oldValue, newValue = newValue,
+    status = status.name, reviewedById = reviewedById.ifBlank { null }, reviewedByName = reviewedByName,
+    timestamp = timestamp.toString(), reviewedAt = reviewedAt?.toString(), rejectionReason = rejectionReason,
+)
+
+class SupabaseApprovalRepository(private val client: SupabaseClient) : ApprovalRepository {
+    private val table = "approval_requests"
+    override suspend fun getAllRequests(): List<ApprovalRequest> =
+        client.postgrest.from(table).select().decodeList<ApprovalRequestRow>()
+            .map { it.toDomain() }.sortedByDescending { it.timestamp }
+    override suspend fun getPendingRequests(): List<ApprovalRequest> =
+        client.postgrest.from(table).select { filter { eq("status", ApprovalStatus.PENDING.name) } }
+            .decodeList<ApprovalRequestRow>().map { it.toDomain() }.sortedByDescending { it.timestamp }
+    override suspend fun getRequestById(id: String): ApprovalRequest? =
+        client.postgrest.from(table).select { filter { eq("id", id) } }
+            .decodeSingleOrNull<ApprovalRequestRow>()?.toDomain()
+    override suspend fun approve(id: String, reviewerId: String, reviewerName: String) {
+        client.postgrest.from(table).update(
+            mapOf(
+                "status" to ApprovalStatus.APPROVED.name,
+                "reviewed_by_id" to reviewerId,
+                "reviewed_by_name" to reviewerName,
+                "reviewed_at" to LocalDateTime.now().toString(),
+            )
+        ) { filter { eq("id", id) } }
+    }
+    override suspend fun reject(id: String, reviewerId: String, reviewerName: String, reason: String) {
+        client.postgrest.from(table).update(
+            mapOf(
+                "status" to ApprovalStatus.REJECTED.name,
+                "reviewed_by_id" to reviewerId,
+                "reviewed_by_name" to reviewerName,
+                "reviewed_at" to LocalDateTime.now().toString(),
+                "rejection_reason" to reason,
+            )
+        ) { filter { eq("id", id) } }
+    }
+    override suspend fun submitRequest(request: ApprovalRequest) {
+        client.postgrest.from(table).insert(request.copy(id = newId()).toRow())
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Allotment Requests
+// ─────────────────────────────────────────────────────────────────────────────
+
+@Serializable
+private data class AllotmentRequestRow(
+    val id: String,
+    @SerialName("medication_entry_id") val medicationEntryId: String,
+    @SerialName("patient_id") val patientId: String,
+    @SerialName("patient_name") val patientName: String = "",
+    @SerialName("medicine_name") val medicineName: String = "",
+    val dose: String = "",
+    @SerialName("scheduled_time") val scheduledTime: String = LocalTime.now().toString(),
+    @SerialName("requested_by_id") val requestedById: String? = null,
+    @SerialName("requested_by_name") val requestedByName: String = "",
+    val status: String = "PENDING",
+    @SerialName("fulfilled_by_id") val fulfilledById: String? = null,
+    @SerialName("fulfilled_by_name") val fulfilledByName: String = "",
+    val timestamp: String = LocalDateTime.now().toString(),
+    @SerialName("fulfilled_at") val fulfilledAt: String? = null,
+)
+private fun AllotmentRequestRow.toDomain() = AllotmentRequest(
+    id = id, medicationEntryId = medicationEntryId, patientId = patientId, patientName = patientName,
+    medicineName = medicineName, dose = dose, scheduledTime = parseTime(scheduledTime),
+    requestedById = requestedById ?: "", requestedByName = requestedByName,
+    status = runCatching { AllotmentRequestStatus.valueOf(status) }.getOrDefault(AllotmentRequestStatus.PENDING),
+    fulfilledById = fulfilledById ?: "", fulfilledByName = fulfilledByName,
+    timestamp = parseTimestamp(timestamp), fulfilledAt = parseTimestampOrNull(fulfilledAt),
+)
+private fun AllotmentRequest.toRow() = AllotmentRequestRow(
+    id = id, medicationEntryId = medicationEntryId, patientId = patientId, patientName = patientName,
+    medicineName = medicineName, dose = dose, scheduledTime = scheduledTime.toString(),
+    requestedById = requestedById.ifBlank { null }, requestedByName = requestedByName, status = status.name,
+    fulfilledById = fulfilledById.ifBlank { null }, fulfilledByName = fulfilledByName,
+    timestamp = timestamp.toString(), fulfilledAt = fulfilledAt?.toString(),
+)
+
+class SupabaseAllotmentRequestRepository(private val client: SupabaseClient) : AllotmentRequestRepository {
+    private val table = "allotment_requests"
+    override suspend fun getAllRequests(): List<AllotmentRequest> =
+        client.postgrest.from(table).select().decodeList<AllotmentRequestRow>()
+            .map { it.toDomain() }.sortedByDescending { it.timestamp }
+    override suspend fun getPendingRequests(): List<AllotmentRequest> =
+        client.postgrest.from(table).select { filter { eq("status", AllotmentRequestStatus.PENDING.name) } }
+            .decodeList<AllotmentRequestRow>().map { it.toDomain() }.sortedByDescending { it.timestamp }
+    override suspend fun submitRequest(request: AllotmentRequest) {
+        client.postgrest.from(table).insert(request.copy(id = newId()).toRow())
+    }
+    override suspend fun fulfillRequest(id: String, staffId: String, staffName: String) {
+        client.postgrest.from(table).update(
+            mapOf(
+                "status" to AllotmentRequestStatus.FULFILLED.name,
+                "fulfilled_by_id" to staffId,
+                "fulfilled_by_name" to staffName,
+                "fulfilled_at" to LocalDateTime.now().toString(),
+            )
+        ) { filter { eq("id", id) } }
+    }
+    override suspend fun getByMedicationEntryId(medicationEntryId: String): AllotmentRequest? =
+        getPendingRequests().firstOrNull { it.medicationEntryId == medicationEntryId }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Notifications
+// ─────────────────────────────────────────────────────────────────────────────
+
+@Serializable
+private data class NotificationRow(
+    val id: String,
+    @SerialName("recipient_staff_id") val recipientStaffId: String? = null,
+    @SerialName("recipient_role") val recipientRole: String? = null,
+    val type: String = "APPROVAL_REQUESTED",
+    val title: String = "", val message: String = "",
+    val timestamp: String = LocalDateTime.now().toString(),
+    @SerialName("is_read") val isRead: Boolean = false,
+    @SerialName("target_route") val targetRoute: String = "",
+)
+private fun NotificationRow.toDomain() = AppNotification(
+    id = id, recipientStaffId = recipientStaffId ?: "",
+    recipientRole = recipientRole?.let { runCatching { UserRole.valueOf(it) }.getOrNull() },
+    type = runCatching { NotificationType.valueOf(type) }.getOrDefault(NotificationType.APPROVAL_REQUESTED),
+    title = title, message = message, timestamp = parseTimestamp(timestamp), isRead = isRead, targetRoute = targetRoute,
+)
+private fun AppNotification.toRow() = NotificationRow(
+    id = id, recipientStaffId = recipientStaffId.ifBlank { null }, recipientRole = recipientRole?.name,
+    type = type.name, title = title, message = message, timestamp = timestamp.toString(),
+    isRead = isRead, targetRoute = targetRoute,
+)
+
+class SupabaseNotificationRepository(private val client: SupabaseClient) : NotificationRepository {
+    private val table = "notifications"
+    override suspend fun getForRecipient(staffId: String, role: UserRole): List<AppNotification> =
+        client.postgrest.from(table).select {
+            filter { or { eq("recipient_staff_id", staffId); eq("recipient_role", role.name) } }
+        }.decodeList<NotificationRow>().map { it.toDomain() }.sortedByDescending { it.timestamp }
+    override suspend fun getUnreadCountForRecipient(staffId: String, role: UserRole): Int =
+        client.postgrest.from(table).select {
+            filter {
+                or { eq("recipient_staff_id", staffId); eq("recipient_role", role.name) }
+                eq("is_read", false)
+            }
+        }.decodeList<NotificationRow>().size
+    override suspend fun add(notification: AppNotification) {
+        client.postgrest.from(table).insert(notification.copy(id = newId()).toRow())
+    }
+    override suspend fun markRead(id: String) {
+        client.postgrest.from(table).update(mapOf("is_read" to true)) { filter { eq("id", id) } }
+    }
+    override suspend fun markAllReadForRecipient(staffId: String, role: UserRole) {
+        client.postgrest.from(table).update(mapOf("is_read" to true)) {
+            filter {
+                or { eq("recipient_staff_id", staffId); eq("recipient_role", role.name) }
+                eq("is_read", false)
+            }
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Audit Log
+// ─────────────────────────────────────────────────────────────────────────────
+
+@Serializable
+private data class AuditLogRow(
+    val id: String, val action: String = "",
+    @SerialName("performed_by_id") val performedById: String? = null,
+    @SerialName("performed_by_name") val performedByName: String = "",
+    @SerialName("target_patient_id") val targetPatientId: String = "",
+    @SerialName("target_patient_name") val targetPatientName: String = "",
+    val details: String = "", val timestamp: String = LocalDateTime.now().toString(),
+    @SerialName("icon_name") val iconName: String = "edit",
+)
+private fun AuditLogRow.toDomain() = AuditLogEntry(
+    id = id, action = action, performedById = performedById ?: "", performedByName = performedByName,
+    targetPatientId = targetPatientId, targetPatientName = targetPatientName, details = details,
+    timestamp = parseTimestamp(timestamp), iconName = iconName.ifBlank { "edit" },
+)
+private fun AuditLogEntry.toRow() = AuditLogRow(
+    id = id, action = action, performedById = performedById.ifBlank { null }, performedByName = performedByName,
+    targetPatientId = targetPatientId, targetPatientName = targetPatientName, details = details,
+    timestamp = timestamp.toString(), iconName = iconName,
+)
+
+class SupabaseAuditRepository(private val client: SupabaseClient) : AuditRepository {
+    private val table = "audit_log"
+    override suspend fun getAllLogs(): List<AuditLogEntry> =
+        client.postgrest.from(table).select().decodeList<AuditLogRow>()
+            .map { it.toDomain() }.sortedByDescending { it.timestamp }
+    override suspend fun addLog(entry: AuditLogEntry) {
+        client.postgrest.from(table).insert(entry.copy(id = newId()).toRow())
+    }
+}
