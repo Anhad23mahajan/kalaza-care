@@ -4,18 +4,23 @@ import android.Manifest
 import android.content.Intent
 import android.os.Build
 import android.os.Bundle
+import android.view.WindowManager
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Surface
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.core.content.ContextCompat
@@ -23,10 +28,14 @@ import android.content.pm.PackageManager
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
+import com.kalazacare.app.KalazaApp
 import com.kalazacare.app.service.EXTRA_TARGET_ROUTE
 import com.kalazacare.app.ui.navigation.KalazaNavHost
+import com.kalazacare.app.ui.theme.KalazaRed
 import com.kalazacare.app.ui.theme.KalazaTheme
 import com.kalazacare.app.util.AppErrors
+import com.kalazacare.app.util.SessionManager
+import kotlinx.coroutines.tasks.await
 
 class MainActivity : ComponentActivity() {
     private var pendingRouteState = mutableStateOf<String?>(null)
@@ -34,6 +43,11 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
+        // Blocks screenshots and screen recording, and shows a blank thumbnail in the
+        // Recents switcher — patient medical/personal data appears on nearly every
+        // screen of this single-Activity app (Dashboard, Med tab, Summary, Scan, Audit
+        // Log...), so this is applied window-wide rather than toggled per-screen.
+        window.setFlags(WindowManager.LayoutParams.FLAG_SECURE, WindowManager.LayoutParams.FLAG_SECURE)
         pendingRouteState.value = intent?.getStringExtra(EXTRA_TARGET_ROUTE)
 
         // ── Hide system navigation bar (Home / Back / Recent buttons) ──
@@ -45,6 +59,42 @@ class MainActivity : ComponentActivity() {
         setContent {
             KalazaTheme {
                 Surface(modifier = Modifier.fillMaxSize()) {
+                    // SessionManager.currentStaff is in-memory only — it does NOT survive the
+                    // OS killing this process in the background, unlike Supabase Auth's own
+                    // session (persisted by the SDK) and Compose Navigation's back stack (restored
+                    // from saved state). Without this gate, a process restart could resurrect the
+                    // user straight onto e.g. the Scan tab with a null SessionManager, silently
+                    // attributing every write to "Unknown" instead of their real name. Block
+                    // rendering the (possibly restored) nav graph until this resolves one way or
+                    // the other: either SessionManager gets repopulated from the still-valid
+                    // Supabase session, or KalazaNavHost's own guard below sends them to Login.
+                    var sessionReady by remember { mutableStateOf(false) }
+                    val app = LocalContext.current.applicationContext as KalazaApp
+                    LaunchedEffect(Unit) {
+                        if (SessionManager.getCurrentStaff() == null) {
+                            runCatching { app.authRepository.restoreSession() }
+                                .getOrNull()
+                                ?.let { SessionManager.setCurrentStaff(it) }
+                        }
+                        // The FCM token used to be saved only at the login screen, so anyone who
+                        // stayed logged in (or whose one login-time save failed) never got a token
+                        // and never received a push. Re-sync on every launch.
+                        SessionManager.getCurrentStaff()?.let { staff ->
+                            runCatching {
+                                val token = com.google.firebase.messaging.FirebaseMessaging.getInstance().token.await()
+                                app.staffRepository.updateFcmToken(staff.id, token)
+                            }.onFailure { AppErrors.report("register this device for notifications", it) }
+                        }
+                        sessionReady = true
+                    }
+
+                    if (!sessionReady) {
+                        Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                            CircularProgressIndicator(color = KalazaRed)
+                        }
+                        return@Surface
+                    }
+
                     val requestNotificationPermission = rememberLauncherForActivityResult(
                         ActivityResultContracts.RequestPermission()
                     ) { /* no-op either way — notifications just won't show if denied */ }

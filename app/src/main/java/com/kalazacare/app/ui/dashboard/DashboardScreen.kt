@@ -35,6 +35,7 @@ fun DashboardScreen(
     val patients by viewModel.patients.collectAsState()
     val searchQuery by viewModel.searchQuery.collectAsState()
     val pendingMeds by viewModel.pendingMeds.collectAsState()
+    val missedMeds by viewModel.missedMeds.collectAsState()
     val pendingApprovals by viewModel.pendingApprovals.collectAsState()
     val totalPatients by viewModel.totalPatients.collectAsState()
     val showArchived by viewModel.showArchived.collectAsState()
@@ -72,7 +73,7 @@ fun DashboardScreen(
             Spacer(modifier = Modifier.height(16.dp))
 
             Text(
-                text = "Good morning, ${SessionManager.getCurrentStaffName()}",
+                text = "${greetingForNow()}, ${SessionManager.getCurrentStaffName()}",
                 style = MaterialTheme.typography.titleLarge,
                 fontWeight = FontWeight.Bold,
                 color = MaterialTheme.colorScheme.onSurface
@@ -87,6 +88,7 @@ fun DashboardScreen(
             ) {
                 item { StatCard("Total Patients", totalPatients.toString()) }
                 item { StatCard("Pending Meds", pendingMeds.toString(), isAlert = pendingMeds > 0) }
+                item { StatCard("Missed Meds", missedMeds.toString(), isAlert = missedMeds > 0) }
                 item { StatCard("Pending Approvals", pendingApprovals.toString(), isAlert = pendingApprovals > 0) }
             }
 
@@ -189,4 +191,11 @@ private fun StatCard(title: String, value: String, isAlert: Boolean = false) {
             )
         }
     }
+}
+
+private fun greetingForNow(): String = when (java.time.LocalTime.now().hour) {
+    in 5..11 -> "Good morning"
+    in 12..16 -> "Good afternoon"
+    in 17..20 -> "Good evening"
+    else -> "Hello"
 }

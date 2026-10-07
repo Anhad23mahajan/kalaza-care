@@ -6,14 +6,24 @@ import com.kalazacare.app.data.remote.SupabaseClients
 import io.github.jan.supabase.SupabaseClient
 import io.github.jan.supabase.auth.auth
 import io.github.jan.supabase.auth.providers.builtin.Email
+import io.github.jan.supabase.functions.functions
 import io.github.jan.supabase.postgrest.postgrest
+import io.ktor.client.statement.HttpResponse
+import io.ktor.client.statement.bodyAsText
+import io.ktor.http.isSuccess
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.tasks.await
+import kotlinx.serialization.EncodeDefault
+import kotlinx.serialization.ExperimentalSerializationApi
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
 import java.time.LocalDate
 import java.util.UUID
@@ -36,6 +46,7 @@ data class StaffRow(
     val role: String = "STAFF",
     val phone: String = "",
     @SerialName("is_active") val isActive: Boolean = true,
+    @EncodeDefault(EncodeDefault.Mode.ALWAYS)
     @SerialName("joined_date") val joinedDate: String = LocalDate.now().toString(),
     @SerialName("auth_email") val authEmail: String = "",
     @SerialName("fcm_token") val fcmToken: String = "",
@@ -55,6 +66,7 @@ private data class StaffInsertRow(
     val role: String = "STAFF",
     val phone: String = "",
     @SerialName("is_active") val isActive: Boolean = true,
+    @EncodeDefault(EncodeDefault.Mode.ALWAYS)
     @SerialName("joined_date") val joinedDate: String = LocalDate.now().toString(),
     @SerialName("auth_email") val authEmail: String = "",
     @SerialName("fcm_token") val fcmToken: String = "",
@@ -117,8 +129,33 @@ class SupabaseAuthRepository(private val client: SupabaseClient) : AuthRepositor
         }
     }
 
-    override fun logout() {
-        logoutScope.launch { runCatching { client.auth.signOut() } }
+    override suspend fun restoreSession(): Staff? {
+        client.auth.awaitInitialization()
+        val uid = client.auth.currentUserOrNull()?.id ?: return null
+        val row = client.postgrest.from(STAFF_TABLE)
+            .select { filter { eq("id", uid) } }
+            .decodeSingleOrNull<StaffRow>() ?: return null
+        if (!row.isActive) return null
+        return row.toDomain()
+    }
+
+    override fun logout(clearPushToken: Boolean) {
+        logoutScope.launch {
+            if (clearPushToken) {
+                // Clear this phone's push token first (needs the still-valid session), otherwise
+                // the account keeps receiving its alerts on this phone after logging out.
+                runCatching {
+                    val uid = client.auth.currentUserOrNull()?.id
+                    if (uid != null) {
+                        client.postgrest.from(STAFF_TABLE).update(mapOf("fcm_token" to "")) { filter { eq("id", uid) } }
+                    }
+                }.onFailure { android.util.Log.w("KalazaPush", "Could not clear FCM token on logout", it) }
+            }
+            runCatching { client.auth.signOut() }
+            if (clearPushToken) {
+                runCatching { com.google.firebase.messaging.FirebaseMessaging.getInstance().deleteToken().await() }
+            }
+        }
     }
 }
 
@@ -168,15 +205,40 @@ class SupabaseStaffRepository(private val client: SupabaseClient) : StaffReposit
     }
 
     override suspend fun deleteStaff(id: String) {
-        // Removes the staff profile. The linked Auth account can't be deleted from
-        // here — the client SDK can only act on the currently-signed-in user, not
-        // an arbitrary one; that needs the Auth Admin API (service_role key). It's
-        // left orphaned but harmless: with no staff row, login() above can never
-        // resolve it back to a Staff, so the account can't sign in again.
-        client.postgrest.from(STAFF_TABLE).delete { filter { eq("id", id) } }
+        // Goes through the admin-delete-staff Edge Function so the linked Supabase
+        // Auth account gets cleaned up too, not just this table row — the client
+        // SDK alone can only ever act on the currently-signed-in user, not an
+        // arbitrary other one, which is what left every past deletion's Auth
+        // account permanently orphaned (see the Edge Function's own doc comment).
+        val response = client.functions.invoke(
+            function = "admin-delete-staff",
+            body = buildJsonObject { put("targetStaffId", id) },
+        )
+        if (!response.status.isSuccess()) {
+            val message = runCatching {
+                Json.parseToJsonElement(response.bodyAsText()).jsonObject["error"]?.jsonPrimitive?.content
+            }.getOrNull()
+            throw Exception(message ?: "Could not delete staff member (${response.status.value})")
+        }
     }
 
     override suspend fun updateFcmToken(staffId: String, token: String) {
         client.postgrest.from(STAFF_TABLE).update(mapOf("fcm_token" to token)) { filter { eq("id", staffId) } }
+    }
+
+    override suspend fun resetPassword(staffId: String, newPassword: String) {
+        val response: HttpResponse = client.functions.invoke(
+            function = "admin-reset-password",
+            body = buildJsonObject {
+                put("targetStaffId", staffId)
+                put("newPassword", newPassword)
+            },
+        )
+        if (!response.status.isSuccess()) {
+            val message = runCatching {
+                Json.parseToJsonElement(response.bodyAsText()).jsonObject["error"]?.jsonPrimitive?.content
+            }.getOrNull()
+            throw Exception(message ?: "Password reset failed (${response.status.value})")
+        }
     }
 }

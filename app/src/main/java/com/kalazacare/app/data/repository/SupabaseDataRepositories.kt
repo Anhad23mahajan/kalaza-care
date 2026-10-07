@@ -11,6 +11,8 @@ import java.time.LocalDate
 import java.time.LocalDateTime
 import java.time.LocalTime
 import java.time.OffsetDateTime
+import java.time.ZoneId
+import java.time.ZoneOffset
 import java.util.UUID
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -23,11 +25,19 @@ import java.util.UUID
 private fun parseDate(s: String): LocalDate = runCatching { LocalDate.parse(s) }.getOrDefault(LocalDate.now())
 private fun parseDateOrNull(s: String?): LocalDate? = s?.let { runCatching { LocalDate.parse(it) }.getOrNull() }
 private fun parseTime(s: String): LocalTime = runCatching { LocalTime.parse(s) }.getOrDefault(LocalTime.now())
-private fun parseTimestamp(s: String): LocalDateTime = runCatching { OffsetDateTime.parse(s).toLocalDateTime() }
-    .recoverCatching { LocalDateTime.parse(s) }.getOrDefault(LocalDateTime.now())
+// timestamptz columns come back with an explicit offset (usually +00:00): convert to the device's
+// zone, rather than just dropping the offset, so a server-written time (Edge Functions, now()
+// defaults) and an app-written one both display as the same real wall-clock time.
+private fun parseTimestamp(s: String): LocalDateTime =
+    runCatching { OffsetDateTime.parse(s).atZoneSameInstant(ZoneId.systemDefault()).toLocalDateTime() }
+        .recoverCatching { LocalDateTime.parse(s) }.getOrDefault(LocalDateTime.now())
 private fun parseTimestampOrNull(s: String?): LocalDateTime? = s?.let { str ->
-    runCatching { OffsetDateTime.parse(str).toLocalDateTime() }.recoverCatching { LocalDateTime.parse(str) }.getOrNull()
+    runCatching { OffsetDateTime.parse(str).atZoneSameInstant(ZoneId.systemDefault()).toLocalDateTime() }
+        .recoverCatching { LocalDateTime.parse(str) }.getOrNull()
 }
+/** "Now" as an ISO string WITH offset — a bare LocalDateTime string gets read by Postgres as UTC, shifting every time by the device's UTC offset. */
+internal fun nowIso(): String = OffsetDateTime.now().toString()
+internal fun LocalDateTime.toIso(): String = atZone(ZoneId.systemDefault()).toOffsetDateTime().toString()
 private fun newId() = UUID.randomUUID().toString()
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -36,7 +46,7 @@ private fun newId() = UUID.randomUUID().toString()
 
 @OptIn(ExperimentalSerializationApi::class)
 @Serializable
-private data class PatientRow(
+internal data class PatientRow(
     val id: String,
     val name: String = "",
     val age: Int = 0,
@@ -55,6 +65,7 @@ private data class PatientRow(
     val allergies: String = "",
     @SerialName("emergency_contact") val emergencyContact: String = "",
     @SerialName("emergency_phone") val emergencyPhone: String = "",
+    @EncodeDefault(EncodeDefault.Mode.ALWAYS)
     @SerialName("admission_date") val admissionDate: String = LocalDate.now().toString(),
     @SerialName("is_archived")
     @EncodeDefault(EncodeDefault.Mode.ALWAYS)
@@ -62,14 +73,14 @@ private data class PatientRow(
     @SerialName("primary_diagnosis") val primaryDiagnosis: String = "",
 )
 
-private fun PatientRow.toDomain() = Patient(
+internal fun PatientRow.toDomain() = Patient(
     id = id, name = name, age = age,
     gender = runCatching { Gender.valueOf(gender) }.getOrDefault(Gender.MALE),
     roomNo = roomNo, medicalHistory = medicalHistory, currentIssues = currentIssues, allergies = allergies,
     emergencyContact = emergencyContact, emergencyPhone = emergencyPhone,
     admissionDate = parseDate(admissionDate), isArchived = isArchived, primaryDiagnosis = primaryDiagnosis,
 )
-private fun Patient.toRow() = PatientRow(
+internal fun Patient.toRow() = PatientRow(
     id = id, name = name, age = age, gender = gender.name, roomNo = roomNo, medicalHistory = medicalHistory,
     currentIssues = currentIssues, allergies = allergies, emergencyContact = emergencyContact,
     emergencyPhone = emergencyPhone, admissionDate = admissionDate.toString(), isArchived = isArchived,
@@ -110,22 +121,24 @@ class SupabasePatientRepository(private val client: SupabaseClient) : PatientRep
 // ─────────────────────────────────────────────────────────────────────────────
 
 @Serializable
-private data class VitalRow(
+internal data class VitalRow(
     val id: String,
     @SerialName("patient_id") val patientId: String,
+    @EncodeDefault(EncodeDefault.Mode.ALWAYS)
     val date: String = LocalDate.now().toString(),
+    @EncodeDefault(EncodeDefault.Mode.ALWAYS)
     val time: String = LocalTime.now().toString(),
     val pulse: String = "", val bp: String = "", val spo2: String = "", val temperature: String = "",
     @SerialName("sugar_fasting") val sugarFasting: String = "",
     @SerialName("sugar_pp") val sugarPP: String = "",
     @SerialName("signed_by") val signedBy: String = "",
 )
-private fun VitalRow.toDomain() = VitalRecord(
+internal fun VitalRow.toDomain() = VitalRecord(
     id = id, patientId = patientId, date = parseDate(date), time = parseTime(time),
     pulse = pulse, bp = bp, spo2 = spo2, temperature = temperature,
     sugarFasting = sugarFasting, sugarPP = sugarPP, signedBy = signedBy,
 )
-private fun VitalRecord.toRow() = VitalRow(
+internal fun VitalRecord.toRow() = VitalRow(
     id = id, patientId = patientId, date = date.toString(), time = time.toString(),
     pulse = pulse, bp = bp, spo2 = spo2, temperature = temperature,
     sugarFasting = sugarFasting, sugarPP = sugarPP, signedBy = signedBy,
@@ -155,7 +168,7 @@ class SupabaseVitalsRepository(private val client: SupabaseClient) : VitalsRepos
 
 @OptIn(ExperimentalSerializationApi::class)
 @Serializable
-private data class MedicationRow(
+internal data class MedicationRow(
     val id: String,
     @SerialName("patient_id") val patientId: String,
     @SerialName("medicine_name") val medicineName: String = "",
@@ -168,6 +181,7 @@ private data class MedicationRow(
     // @EncodeDefault(ALWAYS) forces it into every request regardless.
     @EncodeDefault(EncodeDefault.Mode.ALWAYS)
     val tag: String = "MORNING",
+    @EncodeDefault(EncodeDefault.Mode.ALWAYS)
     @SerialName("scheduled_date") val scheduledDate: String = LocalDate.now().toString(),
     @SerialName("is_recurring") val isRecurring: Boolean = true,
     // Comma-separated ISO day-of-week numbers (1=Mon..7=Sun), e.g. "1,3,5".
@@ -182,14 +196,11 @@ private data class MedicationRow(
     @SerialName("administered_by") val administeredBy: String = "",
     @SerialName("administered_at") val administeredAt: String? = null,
     val notes: String = "",
-    @SerialName("allotment_status") val allotmentStatus: String = "NOT_ALLOTTED",
-    @SerialName("allotted_by_id") val allottedById: String? = null,
-    @SerialName("allotted_by_name") val allottedByName: String = "",
-    @SerialName("allotted_at") val allottedAt: String? = null,
-    @SerialName("allotment_scanned_code") val allotmentScannedCode: String = "",
     @SerialName("administered_scanned_code") val administeredScannedCode: String = "",
+    // Set by the DB default on insert; null here so it's never sent (and never overwritten on edit).
+    @SerialName("created_at") val createdAt: String? = null,
 )
-private fun MedicationRow.toDomain(): MedicationEntry {
+internal fun MedicationRow.toDomain(): MedicationEntry {
     val entry = MedicationEntry(
         id = id, patientId = patientId, medicineName = medicineName, dose = dose, quantity = quantity,
         scheduleTime = parseTime(scheduleTime),
@@ -198,21 +209,17 @@ private fun MedicationRow.toDomain(): MedicationEntry {
         recurringDays = recurringDays.split(",").mapNotNull { it.trim().toIntOrNull() }.toSet(),
         status = runCatching { MedStatus.valueOf(status) }.getOrDefault(MedStatus.PENDING),
         administeredBy = administeredBy, administeredAt = parseTimestampOrNull(administeredAt), notes = notes,
-        allotmentStatus = runCatching { AllotmentStatus.valueOf(allotmentStatus) }.getOrDefault(AllotmentStatus.NOT_ALLOTTED),
-        allottedById = allottedById ?: "", allottedByName = allottedByName,
-        allottedAt = parseTimestampOrNull(allottedAt), allotmentScannedCode = allotmentScannedCode,
         administeredScannedCode = administeredScannedCode,
+        createdAt = parseTimestampOrNull(createdAt),
     )
     return entry.withComputedStatus()
 }
-private fun MedicationEntry.toRow() = MedicationRow(
+internal fun MedicationEntry.toRow() = MedicationRow(
     id = id, patientId = patientId, medicineName = medicineName, dose = dose, quantity = quantity,
     scheduleTime = scheduleTime.toString(), tag = tag.name,
     scheduledDate = scheduledDate.toString(), isRecurring = isRecurring,
     recurringDays = recurringDays.sorted().joinToString(","), status = status.name,
-    administeredBy = administeredBy, administeredAt = administeredAt?.toString(), notes = notes,
-    allotmentStatus = allotmentStatus.name, allottedById = allottedById.ifBlank { null }, allottedByName = allottedByName,
-    allottedAt = allottedAt?.toString(), allotmentScannedCode = allotmentScannedCode,
+    administeredBy = administeredBy, administeredAt = administeredAt?.toIso(), notes = notes,
     administeredScannedCode = administeredScannedCode,
 )
 
@@ -224,10 +231,10 @@ private fun MedicationEntry.toRow() = MedicationRow(
  * judged against today's date instead — only a one-off dose is checked
  * against its own stored date.
  *
- * A *recurring* dose that was ALLOTTED/ADMINISTERED also resets back to a
- * fresh PENDING/OVERDUE view once its allotted/administered day has passed —
- * otherwise "given yesterday" would incorrectly suppress today's occurrence
- * forever. This reset is display-time only (nothing is written back), and it
+ * A *recurring* dose that was ADMINISTERED also resets back to a fresh
+ * PENDING/OVERDUE view once its administered day has passed — otherwise
+ * "given yesterday" would incorrectly suppress today's occurrence forever.
+ * This reset is display-time only (nothing is written back), and it
  * doesn't lose history: the permanent compliance record lives in
  * `medication_evidence_log` (see [MedicationEvidenceEvent]), not in these
  * flat columns.
@@ -241,17 +248,16 @@ private fun MedicationEntry.withComputedStatus(): MedicationEntry {
                 administeredScannedCode = "",
             )
         }
-        if (e.allotmentStatus == AllotmentStatus.ALLOTTED && e.allottedAt?.toLocalDate() != LocalDate.now()) {
-            e = e.copy(
-                allotmentStatus = AllotmentStatus.NOT_ALLOTTED, allottedById = "", allottedByName = "",
-                allottedAt = null, allotmentScannedCode = "",
-            )
-        }
     }
     if (e.status != MedStatus.PENDING && e.status != MedStatus.OVERDUE) return e
     val effectiveDate = if (e.isRecurring) LocalDate.now() else e.scheduledDate
     val scheduledAt = LocalDateTime.of(effectiveDate, e.scheduleTime)
-    val computed = if (scheduledAt.isBefore(LocalDateTime.now())) MedStatus.OVERDUE else MedStatus.PENDING
+    // Still PENDING through the whole giving window; only Missed once it has closed.
+    val windowClosesAt = scheduledAt.plusMinutes(DOSE_WINDOW_MINUTES.toLong())
+    // A dose added after today's window already closed (e.g. an 8 AM dose entered at 6 PM) was never
+    // actually due today — it starts counting as Missed from its next occurrence, not retroactively.
+    val addedTooLate = e.createdAt?.isAfter(windowClosesAt) == true
+    val computed = if (!addedTooLate && windowClosesAt.isBefore(LocalDateTime.now())) MedStatus.OVERDUE else MedStatus.PENDING
     return if (computed != e.status) e.copy(status = computed) else e
 }
 
@@ -314,7 +320,7 @@ class SupabaseMedicationRepository(private val client: SupabaseClient) : Medicat
             mapOf(
                 "status" to MedStatus.ADMINISTERED.name,
                 "administered_by" to staffName,
-                "administered_at" to LocalDateTime.now().toString(),
+                "administered_at" to nowIso(),
                 "administered_scanned_code" to scannedCode,
             )
         ) { filter { eq("id", id) } }
@@ -323,53 +329,91 @@ class SupabaseMedicationRepository(private val client: SupabaseClient) : Medicat
                 MedicationEvidenceRow(
                     id = newId(), medicationId = id, patientId = med.patientId, medicineName = med.medicineName,
                     kind = "ADMINISTRATION", staffId = null, staffName = staffName,
-                    scannedCode = scannedCode, occurredAt = LocalDateTime.now().toString(),
+                    scannedCode = scannedCode, occurredAt = nowIso(),
                 )
             )
-        }
-    }
-    override suspend fun allotMedication(id: String, staffId: String, staffName: String, scannedCode: String) {
-        val med = client.postgrest.from(table).select { filter { eq("id", id) } }.decodeSingleOrNull<MedicationRow>()
-        client.postgrest.from(table).update(
-            mapOf(
-                "allotment_status" to AllotmentStatus.ALLOTTED.name,
-                "allotted_by_id" to staffId,
-                "allotted_by_name" to staffName,
-                "allotted_at" to LocalDateTime.now().toString(),
-                "allotment_scanned_code" to scannedCode,
-            )
-        ) { filter { eq("id", id) } }
-        if (med != null) {
-            client.postgrest.from(EVIDENCE_LOG_TABLE).insert(
-                MedicationEvidenceRow(
+            // Per-day history ledger — the watchdog Edge Function writes the MISSED
+            // counterpart at its own 5-min-after-deadline checkpoint; on conflict do
+            // nothing covers the (harmless) race where both fire for the same day.
+            client.postgrest.from(HISTORY_LOG_TABLE).upsert(
+                MedicationHistoryRow(
                     id = newId(), medicationId = id, patientId = med.patientId, medicineName = med.medicineName,
-                    kind = "ALLOTMENT", staffId = staffId, staffName = staffName,
-                    scannedCode = scannedCode, occurredAt = LocalDateTime.now().toString(),
+                    dose = med.dose, tag = med.tag, date = LocalDate.now().toString(),
+                    status = "ADMINISTERED", administeredBy = staffName,
+                    administeredAt = nowIso(), scannedCode = scannedCode,
                 )
-            )
+            ) {
+                onConflict = "medication_id,date"
+                ignoreDuplicates = true
+            }
         }
     }
     override suspend fun getEvidenceLog(): List<MedicationEvidenceEvent> =
         client.postgrest.from(EVIDENCE_LOG_TABLE).select().decodeList<MedicationEvidenceRow>()
             .map { it.toDomain() }.sortedByDescending { it.occurredAt }
+    override suspend fun getAdministrationHistory(patientId: String): List<MedicationHistoryEntry> =
+        client.postgrest.from(HISTORY_LOG_TABLE).select { filter { eq("patient_id", patientId) } }
+            .decodeList<MedicationHistoryRow>().map { it.toDomain() }.sortedByDescending { it.date }
 }
 
 private const val EVIDENCE_LOG_TABLE = "medication_evidence_log"
+private const val HISTORY_LOG_TABLE = "medication_administration_log"
+
+// Same encodeDefaults=false bug as ApprovalRequestRow.entityType / NotificationRow.type
+// above — this table's tag/date/status columns are all NOT NULL with no DB-level
+// default, so a value equal to its Kotlin default is silently dropped and fails
+// with a NOT NULL violation. Unlike the other two, this hits the class's only real
+// insert path (markAdministered()) on nearly every call: `date` is recomputed to
+// today on every call (so it matches its own default expression virtually always),
+// and `tag` matches whenever the dose happens to be a Morning dose.
+@OptIn(ExperimentalSerializationApi::class)
+@Serializable
+internal data class MedicationHistoryRow(
+    val id: String,
+    // Nullable: deleting a medication keeps its history rows (they carry their own copy of the
+    // name/dose/tag), with this link set to NULL — see the on-delete-set-null migration.
+    @SerialName("medication_id") val medicationId: String? = null,
+    @SerialName("patient_id") val patientId: String,
+    @SerialName("medicine_name") val medicineName: String = "",
+    val dose: String = "",
+    @EncodeDefault(EncodeDefault.Mode.ALWAYS)
+    val tag: String = "MORNING",
+    @EncodeDefault(EncodeDefault.Mode.ALWAYS)
+    val date: String = LocalDate.now().toString(),
+    @EncodeDefault(EncodeDefault.Mode.ALWAYS)
+    val status: String = "MISSED",
+    @SerialName("administered_by") val administeredBy: String = "",
+    @SerialName("administered_at") val administeredAt: String? = null,
+    @SerialName("scanned_code") val scannedCode: String = "",
+)
+internal fun MedicationHistoryRow.toDomain() = MedicationHistoryEntry(
+    id = id, medicationId = medicationId ?: "", patientId = patientId, medicineName = medicineName, dose = dose,
+    tag = runCatching { DoseTag.valueOf(tag) }.getOrDefault(DoseTag.MORNING),
+    date = parseDate(date),
+    status = runCatching { AdministrationOutcome.valueOf(status) }.getOrDefault(AdministrationOutcome.MISSED),
+    administeredBy = administeredBy, administeredAt = parseTimestampOrNull(administeredAt), scannedCode = scannedCode,
+)
+internal fun MedicationHistoryEntry.toRow() = MedicationHistoryRow(
+    id = id, medicationId = medicationId.ifBlank { null }, patientId = patientId, medicineName = medicineName, dose = dose,
+    tag = tag.name, date = date.toString(), status = status.name,
+    administeredBy = administeredBy, administeredAt = administeredAt?.toIso(), scannedCode = scannedCode,
+)
 
 @Serializable
-private data class MedicationEvidenceRow(
+internal data class MedicationEvidenceRow(
     val id: String,
-    @SerialName("medication_id") val medicationId: String,
+    // Nullable for the same reason as MedicationHistoryRow: the compliance record must outlive the medication.
+    @SerialName("medication_id") val medicationId: String? = null,
     @SerialName("patient_id") val patientId: String,
     @SerialName("medicine_name") val medicineName: String = "",
     val kind: String = "",
     @SerialName("staff_id") val staffId: String? = null,
     @SerialName("staff_name") val staffName: String = "",
     @SerialName("scanned_code") val scannedCode: String = "",
-    @SerialName("occurred_at") val occurredAt: String = LocalDateTime.now().toString(),
+    @SerialName("occurred_at") val occurredAt: String = nowIso(),
 )
-private fun MedicationEvidenceRow.toDomain() = MedicationEvidenceEvent(
-    id = id, medicationId = medicationId, patientId = patientId, medicineName = medicineName,
+internal fun MedicationEvidenceRow.toDomain() = MedicationEvidenceEvent(
+    id = id, medicationId = medicationId ?: "", patientId = patientId, medicineName = medicineName,
     kind = kind, staffId = staffId ?: "", staffName = staffName, scannedCode = scannedCode,
     occurredAt = parseTimestamp(occurredAt),
 )
@@ -379,33 +423,35 @@ private fun MedicationEvidenceRow.toDomain() = MedicationEvidenceEvent(
 // ─────────────────────────────────────────────────────────────────────────────
 
 @Serializable
-private data class UtilityRecordRow(
+internal data class UtilityRecordRow(
     val id: String,
     @SerialName("patient_id") val patientId: String,
+    @EncodeDefault(EncodeDefault.Mode.ALWAYS)
     val date: String = LocalDate.now().toString(),
+    @EncodeDefault(EncodeDefault.Mode.ALWAYS)
     val time: String = LocalTime.now().toString(),
     val quantities: Map<String, Int> = emptyMap(),
     @SerialName("issued_to_caregiver") val issuedToCaregiver: String = "",
     @SerialName("issued_by_supervisor") val issuedBySupervisor: String = "",
     @SerialName("checked_by") val checkedBy: String = "",
 )
-private fun UtilityRecordRow.toDomain() = UtilityRecord(
+internal fun UtilityRecordRow.toDomain() = UtilityRecord(
     id = id, patientId = patientId, date = parseDate(date), time = parseTime(time), quantities = quantities,
     issuedToCaregiver = issuedToCaregiver, issuedBySupervisor = issuedBySupervisor, checkedBy = checkedBy,
 )
-private fun UtilityRecord.toRow() = UtilityRecordRow(
+internal fun UtilityRecord.toRow() = UtilityRecordRow(
     id = id, patientId = patientId, date = date.toString(), time = time.toString(), quantities = quantities,
     issuedToCaregiver = issuedToCaregiver, issuedBySupervisor = issuedBySupervisor, checkedBy = checkedBy,
 )
 
 @Serializable
-private data class UtilityItemRow(
+internal data class UtilityItemRow(
     val id: String, val name: String = "", val unit: String = "pcs",
     @SerialName("display_order") val displayOrder: Int = 0,
     @SerialName("is_active") val isActive: Boolean = true,
 )
-private fun UtilityItemRow.toDomain() = UtilityItem(id = id, name = name, unit = unit, displayOrder = displayOrder, isActive = isActive)
-private fun UtilityItem.toRow() = UtilityItemRow(id = id, name = name, unit = unit, displayOrder = displayOrder, isActive = isActive)
+internal fun UtilityItemRow.toDomain() = UtilityItem(id = id, name = name, unit = unit, displayOrder = displayOrder, isActive = isActive)
+internal fun UtilityItem.toRow() = UtilityItemRow(id = id, name = name, unit = unit, displayOrder = displayOrder, isActive = isActive)
 
 class SupabaseUtilityRepository(private val client: SupabaseClient) : UtilityRepository {
     private val recordsTable = "utility_records"
@@ -424,6 +470,9 @@ class SupabaseUtilityRepository(private val client: SupabaseClient) : UtilityRep
     }
     override suspend fun updateUtilityRecord(record: UtilityRecord) {
         client.postgrest.from(recordsTable).update(record.toRow()) { filter { eq("id", record.id) } }
+    }
+    override suspend fun deleteUtilityRecord(id: String) {
+        client.postgrest.from(recordsTable).delete { filter { eq("id", id) } }
     }
     override suspend fun getUtilityItems(): List<UtilityItem> = getAllUtilityItems().filter { it.isActive }
     override suspend fun getAllUtilityItems(): List<UtilityItem> =
@@ -445,12 +494,14 @@ class SupabaseUtilityRepository(private val client: SupabaseClient) : UtilityRep
 // ─────────────────────────────────────────────────────────────────────────────
 
 @Serializable
-private data class DoctorVisitRow(
+internal data class DoctorVisitRow(
     val id: String,
     @SerialName("patient_id") val patientId: String,
     @SerialName("doctor_name") val doctorName: String = "",
     val specialty: String = "",
+    @EncodeDefault(EncodeDefault.Mode.ALWAYS)
     val date: String = LocalDate.now().toString(),
+    @EncodeDefault(EncodeDefault.Mode.ALWAYS)
     val time: String = LocalTime.now().toString(),
     val notes: String = "",
     @SerialName("next_visit_date") val nextVisitDate: String? = null,
@@ -458,13 +509,13 @@ private data class DoctorVisitRow(
     @SerialName("is_confirmed") val isConfirmed: Boolean = false,
     @SerialName("is_archived") val isArchived: Boolean = false,
 )
-private fun DoctorVisitRow.toDomain() = DoctorVisit(
+internal fun DoctorVisitRow.toDomain() = DoctorVisit(
     id = id, patientId = patientId, doctorName = doctorName, specialty = specialty,
     date = parseDate(date), time = parseTime(time), notes = notes,
     nextVisitDate = parseDateOrNull(nextVisitDate), prescriptionChanges = prescriptionChanges,
     isConfirmed = isConfirmed, isArchived = isArchived,
 )
-private fun DoctorVisit.toRow() = DoctorVisitRow(
+internal fun DoctorVisit.toRow() = DoctorVisitRow(
     id = id, patientId = patientId, doctorName = doctorName, specialty = specialty,
     date = date.toString(), time = time.toString(), notes = notes,
     nextVisitDate = nextVisitDate?.toString(), prescriptionChanges = prescriptionChanges,
@@ -493,21 +544,21 @@ class SupabaseDoctorVisitRepository(private val client: SupabaseClient) : Doctor
 }
 
 @Serializable
-private data class CareNoteRow(
+internal data class CareNoteRow(
     val id: String,
     @SerialName("patient_id") val patientId: String,
     @SerialName("staff_id") val staffId: String? = null,
     @SerialName("staff_name") val staffName: String = "",
-    val timestamp: String = LocalDateTime.now().toString(),
+    val timestamp: String = nowIso(),
     val note: String = "",
 )
-private fun CareNoteRow.toDomain() = CareNote(
+internal fun CareNoteRow.toDomain() = CareNote(
     id = id, patientId = patientId, staffId = staffId ?: "", staffName = staffName,
     timestamp = parseTimestamp(timestamp), note = note,
 )
-private fun CareNote.toRow() = CareNoteRow(
+internal fun CareNote.toRow() = CareNoteRow(
     id = id, patientId = patientId, staffId = staffId.ifBlank { null }, staffName = staffName,
-    timestamp = timestamp.toString(), note = note,
+    timestamp = timestamp.toIso(), note = note,
 )
 
 class SupabaseCareNoteRepository(private val client: SupabaseClient) : CareNoteRepository {
@@ -529,9 +580,17 @@ class SupabaseCareNoteRepository(private val client: SupabaseClient) : CareNoteR
 // Approval Queue
 // ─────────────────────────────────────────────────────────────────────────────
 
+@OptIn(ExperimentalSerializationApi::class)
 @Serializable
-private data class ApprovalRequestRow(
+internal data class ApprovalRequestRow(
     val id: String,
+    // supabase-kt's encodeDefaults=false drops a field that equals its Kotlin
+    // default — harmless for every other field here since the DB column has a
+    // matching default, but entity_type's column is NOT NULL with no default,
+    // so the extremely common case of a PATIENT-entity request (the Kotlin
+    // default) was silently omitted from the insert and failed with a 23502
+    // NOT NULL violation. Same bug class as MedicationRow.tag (see section 21).
+    @EncodeDefault(EncodeDefault.Mode.ALWAYS)
     @SerialName("entity_type") val entityType: String = "PATIENT",
     @SerialName("entity_id") val entityId: String = "",
     val action: String = "EDIT",
@@ -545,11 +604,11 @@ private data class ApprovalRequestRow(
     val status: String = "PENDING",
     @SerialName("reviewed_by_id") val reviewedById: String? = null,
     @SerialName("reviewed_by_name") val reviewedByName: String = "",
-    val timestamp: String = LocalDateTime.now().toString(),
+    val timestamp: String = nowIso(),
     @SerialName("reviewed_at") val reviewedAt: String? = null,
     @SerialName("rejection_reason") val rejectionReason: String = "",
 )
-private fun ApprovalRequestRow.toDomain() = ApprovalRequest(
+internal fun ApprovalRequestRow.toDomain() = ApprovalRequest(
     id = id, entityType = runCatching { ApprovalEntityType.valueOf(entityType) }.getOrDefault(ApprovalEntityType.PATIENT),
     entityId = entityId, action = runCatching { ApprovalAction.valueOf(action) }.getOrDefault(ApprovalAction.EDIT),
     patientId = patientId ?: "", patientName = patientName, requestedById = requestedById ?: "",
@@ -558,12 +617,12 @@ private fun ApprovalRequestRow.toDomain() = ApprovalRequest(
     reviewedById = reviewedById ?: "", reviewedByName = reviewedByName, timestamp = parseTimestamp(timestamp),
     reviewedAt = parseTimestampOrNull(reviewedAt), rejectionReason = rejectionReason,
 )
-private fun ApprovalRequest.toRow() = ApprovalRequestRow(
+internal fun ApprovalRequest.toRow() = ApprovalRequestRow(
     id = id, entityType = entityType.name, entityId = entityId, action = action.name,
     patientId = patientId.ifBlank { null }, patientName = patientName, requestedById = requestedById.ifBlank { null },
     requestedByName = requestedByName, fieldChanged = fieldChanged, oldValue = oldValue, newValue = newValue,
     status = status.name, reviewedById = reviewedById.ifBlank { null }, reviewedByName = reviewedByName,
-    timestamp = timestamp.toString(), reviewedAt = reviewedAt?.toString(), rejectionReason = rejectionReason,
+    timestamp = timestamp.toIso(), reviewedAt = reviewedAt?.toIso(), rejectionReason = rejectionReason,
 )
 
 class SupabaseApprovalRepository(private val client: SupabaseClient) : ApprovalRepository {
@@ -583,7 +642,7 @@ class SupabaseApprovalRepository(private val client: SupabaseClient) : ApprovalR
                 "status" to ApprovalStatus.APPROVED.name,
                 "reviewed_by_id" to reviewerId,
                 "reviewed_by_name" to reviewerName,
-                "reviewed_at" to LocalDateTime.now().toString(),
+                "reviewed_at" to nowIso(),
             )
         ) { filter { eq("id", id) } }
     }
@@ -593,7 +652,7 @@ class SupabaseApprovalRepository(private val client: SupabaseClient) : ApprovalR
                 "status" to ApprovalStatus.REJECTED.name,
                 "reviewed_by_id" to reviewerId,
                 "reviewed_by_name" to reviewerName,
-                "reviewed_at" to LocalDateTime.now().toString(),
+                "reviewed_at" to nowIso(),
                 "rejection_reason" to reason,
             )
         ) { filter { eq("id", id) } }
@@ -604,105 +663,65 @@ class SupabaseApprovalRepository(private val client: SupabaseClient) : ApprovalR
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Allotment Requests
-// ─────────────────────────────────────────────────────────────────────────────
-
-@Serializable
-private data class AllotmentRequestRow(
-    val id: String,
-    @SerialName("medication_entry_id") val medicationEntryId: String,
-    @SerialName("patient_id") val patientId: String,
-    @SerialName("patient_name") val patientName: String = "",
-    @SerialName("medicine_name") val medicineName: String = "",
-    val dose: String = "",
-    @SerialName("scheduled_time") val scheduledTime: String = LocalTime.now().toString(),
-    @SerialName("requested_by_id") val requestedById: String? = null,
-    @SerialName("requested_by_name") val requestedByName: String = "",
-    val status: String = "PENDING",
-    @SerialName("fulfilled_by_id") val fulfilledById: String? = null,
-    @SerialName("fulfilled_by_name") val fulfilledByName: String = "",
-    val timestamp: String = LocalDateTime.now().toString(),
-    @SerialName("fulfilled_at") val fulfilledAt: String? = null,
-)
-private fun AllotmentRequestRow.toDomain() = AllotmentRequest(
-    id = id, medicationEntryId = medicationEntryId, patientId = patientId, patientName = patientName,
-    medicineName = medicineName, dose = dose, scheduledTime = parseTime(scheduledTime),
-    requestedById = requestedById ?: "", requestedByName = requestedByName,
-    status = runCatching { AllotmentRequestStatus.valueOf(status) }.getOrDefault(AllotmentRequestStatus.PENDING),
-    fulfilledById = fulfilledById ?: "", fulfilledByName = fulfilledByName,
-    timestamp = parseTimestamp(timestamp), fulfilledAt = parseTimestampOrNull(fulfilledAt),
-)
-private fun AllotmentRequest.toRow() = AllotmentRequestRow(
-    id = id, medicationEntryId = medicationEntryId, patientId = patientId, patientName = patientName,
-    medicineName = medicineName, dose = dose, scheduledTime = scheduledTime.toString(),
-    requestedById = requestedById.ifBlank { null }, requestedByName = requestedByName, status = status.name,
-    fulfilledById = fulfilledById.ifBlank { null }, fulfilledByName = fulfilledByName,
-    timestamp = timestamp.toString(), fulfilledAt = fulfilledAt?.toString(),
-)
-
-class SupabaseAllotmentRequestRepository(private val client: SupabaseClient) : AllotmentRequestRepository {
-    private val table = "allotment_requests"
-    override suspend fun getAllRequests(): List<AllotmentRequest> =
-        client.postgrest.from(table).select().decodeList<AllotmentRequestRow>()
-            .map { it.toDomain() }.sortedByDescending { it.timestamp }
-    override suspend fun getPendingRequests(): List<AllotmentRequest> =
-        client.postgrest.from(table).select { filter { eq("status", AllotmentRequestStatus.PENDING.name) } }
-            .decodeList<AllotmentRequestRow>().map { it.toDomain() }.sortedByDescending { it.timestamp }
-    override suspend fun submitRequest(request: AllotmentRequest) {
-        client.postgrest.from(table).insert(request.copy(id = newId()).toRow())
-    }
-    override suspend fun fulfillRequest(id: String, staffId: String, staffName: String) {
-        client.postgrest.from(table).update(
-            mapOf(
-                "status" to AllotmentRequestStatus.FULFILLED.name,
-                "fulfilled_by_id" to staffId,
-                "fulfilled_by_name" to staffName,
-                "fulfilled_at" to LocalDateTime.now().toString(),
-            )
-        ) { filter { eq("id", id) } }
-    }
-    override suspend fun getByMedicationEntryId(medicationEntryId: String): AllotmentRequest? =
-        getPendingRequests().firstOrNull { it.medicationEntryId == medicationEntryId }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
 // Notifications
 // ─────────────────────────────────────────────────────────────────────────────
 
+@OptIn(ExperimentalSerializationApi::class)
 @Serializable
-private data class NotificationRow(
+internal data class NotificationRow(
     val id: String,
     @SerialName("recipient_staff_id") val recipientStaffId: String? = null,
     @SerialName("recipient_role") val recipientRole: String? = null,
+    // Same encodeDefaults=false bug as ApprovalRequestRow.entityType above: the
+    // extremely common case of an APPROVAL_REQUESTED notification (the Kotlin
+    // default) was silently omitted from the insert. `type` has no DB column
+    // default, so the omitted value evaluated as null against notifications_insert's
+    // per-type RLS check ("type = ANY(...)") and failed with 42501, not 23502 —
+    // a different-looking symptom of the exact same root cause.
+    @EncodeDefault(EncodeDefault.Mode.ALWAYS)
     val type: String = "APPROVAL_REQUESTED",
     val title: String = "", val message: String = "",
-    val timestamp: String = LocalDateTime.now().toString(),
+    val timestamp: String = nowIso(),
     @SerialName("is_read") val isRead: Boolean = false,
     @SerialName("target_route") val targetRoute: String = "",
 )
-private fun NotificationRow.toDomain() = AppNotification(
+internal fun NotificationRow.toDomain() = AppNotification(
     id = id, recipientStaffId = recipientStaffId ?: "",
     recipientRole = recipientRole?.let { runCatching { UserRole.valueOf(it) }.getOrNull() },
     type = runCatching { NotificationType.valueOf(type) }.getOrDefault(NotificationType.APPROVAL_REQUESTED),
     title = title, message = message, timestamp = parseTimestamp(timestamp), isRead = isRead, targetRoute = targetRoute,
 )
-private fun AppNotification.toRow() = NotificationRow(
+internal fun AppNotification.toRow() = NotificationRow(
     id = id, recipientStaffId = recipientStaffId.ifBlank { null }, recipientRole = recipientRole?.name,
-    type = type.name, title = title, message = message, timestamp = timestamp.toString(),
+    type = type.name, title = title, message = message, timestamp = timestamp.toIso(),
     isRead = isRead, targetRoute = targetRoute,
 )
+
+/**
+ * Only this many days of notifications are listed/counted. The watchdogs generate ~40 a day for the Supervisor
+ * alone (due/missed doses, vitals, utilities), so a longer window leaves the badge permanently at "99+" and the
+ * list useless; 3 days still covers a weekend, and anything older lives on in the Audit Log / Med History.
+ */
+internal const val NOTIFICATION_WINDOW_DAYS = 3L
+
+/** UTC "Z" form on purpose: a "+05:30" offset in a query string would have its "+" read as a space. */
+private fun notificationCutoffIso(): String = OffsetDateTime.now(ZoneOffset.UTC).minusDays(NOTIFICATION_WINDOW_DAYS).toString()
 
 class SupabaseNotificationRepository(private val client: SupabaseClient) : NotificationRepository {
     private val table = "notifications"
     override suspend fun getForRecipient(staffId: String, role: UserRole): List<AppNotification> =
         client.postgrest.from(table).select {
-            filter { or { eq("recipient_staff_id", staffId); eq("recipient_role", role.name) } }
+            filter {
+                or { eq("recipient_staff_id", staffId); eq("recipient_role", role.notificationRole().name) }
+                gte("timestamp", notificationCutoffIso())
+            }
         }.decodeList<NotificationRow>().map { it.toDomain() }.sortedByDescending { it.timestamp }
     override suspend fun getUnreadCountForRecipient(staffId: String, role: UserRole): Int =
         client.postgrest.from(table).select {
             filter {
-                or { eq("recipient_staff_id", staffId); eq("recipient_role", role.name) }
+                or { eq("recipient_staff_id", staffId); eq("recipient_role", role.notificationRole().name) }
                 eq("is_read", false)
+                gte("timestamp", notificationCutoffIso())
             }
         }.decodeList<NotificationRow>().size
     override suspend fun add(notification: AppNotification) {
@@ -714,7 +733,7 @@ class SupabaseNotificationRepository(private val client: SupabaseClient) : Notif
     override suspend fun markAllReadForRecipient(staffId: String, role: UserRole) {
         client.postgrest.from(table).update(mapOf("is_read" to true)) {
             filter {
-                or { eq("recipient_staff_id", staffId); eq("recipient_role", role.name) }
+                or { eq("recipient_staff_id", staffId); eq("recipient_role", role.notificationRole().name) }
                 eq("is_read", false)
             }
         }
@@ -726,24 +745,24 @@ class SupabaseNotificationRepository(private val client: SupabaseClient) : Notif
 // ─────────────────────────────────────────────────────────────────────────────
 
 @Serializable
-private data class AuditLogRow(
+internal data class AuditLogRow(
     val id: String, val action: String = "",
     @SerialName("performed_by_id") val performedById: String? = null,
     @SerialName("performed_by_name") val performedByName: String = "",
     @SerialName("target_patient_id") val targetPatientId: String = "",
     @SerialName("target_patient_name") val targetPatientName: String = "",
-    val details: String = "", val timestamp: String = LocalDateTime.now().toString(),
+    val details: String = "", val timestamp: String = nowIso(),
     @SerialName("icon_name") val iconName: String = "edit",
 )
-private fun AuditLogRow.toDomain() = AuditLogEntry(
+internal fun AuditLogRow.toDomain() = AuditLogEntry(
     id = id, action = action, performedById = performedById ?: "", performedByName = performedByName,
     targetPatientId = targetPatientId, targetPatientName = targetPatientName, details = details,
     timestamp = parseTimestamp(timestamp), iconName = iconName.ifBlank { "edit" },
 )
-private fun AuditLogEntry.toRow() = AuditLogRow(
+internal fun AuditLogEntry.toRow() = AuditLogRow(
     id = id, action = action, performedById = performedById.ifBlank { null }, performedByName = performedByName,
     targetPatientId = targetPatientId, targetPatientName = targetPatientName, details = details,
-    timestamp = timestamp.toString(), iconName = iconName,
+    timestamp = timestamp.toIso(), iconName = iconName,
 )
 
 class SupabaseAuditRepository(private val client: SupabaseClient) : AuditRepository {

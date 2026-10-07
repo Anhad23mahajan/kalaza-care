@@ -1,11 +1,23 @@
 package com.kalazacare.app.ui.navigation
 
-import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.*
+import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.SnackbarHost
+import androidx.compose.material3.SnackbarHostState
+import androidx.compose.material3.Text
 import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.input.pointer.PointerEventPass
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalLifecycleOwner
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.viewmodel.compose.viewModel
@@ -20,31 +32,35 @@ import com.kalazacare.app.ui.config.ConfigScreen
 import com.kalazacare.app.ui.dashboard.DashboardScreen
 import com.kalazacare.app.ui.dashboard.SuperAdminOverviewScreen
 import com.kalazacare.app.ui.login.LoginScreen
-import com.kalazacare.app.ui.medicine.MedicineScreen
 import com.kalazacare.app.ui.notifications.NotificationScreen
 import com.kalazacare.app.ui.patient.AddEditPatientScreen
 import com.kalazacare.app.ui.patient.PatientProfileScreen
 import com.kalazacare.app.ui.summary.SummaryScreen
 import com.kalazacare.app.ui.todo.TodoListScreen
 import com.kalazacare.app.util.SessionManager
+import kotlinx.coroutines.delay
+
+/** Same 15 minutes for every role — no per-role variance. */
+private const val AUTO_LOGOUT_TIMEOUT_MS = 15 * 60 * 1000L
+/** How often the idle check runs; doesn't need to be finer than this. */
+private const val AUTO_LOGOUT_POLL_MS = 15_000L
 
 object Routes {
     const val LOGIN           = "login"
     const val DASHBOARD       = "dashboard"
     const val SUPER_ADMIN_OVERVIEW = "super_admin_overview"
     const val TODO_LIST       = "todo_list"
-    const val PATIENT_PROFILE = "patient/{patientId}"
+    const val PATIENT_PROFILE = "patient/{patientId}?tab={tab}"
     const val PATIENT_NEW     = "patient/new"
     const val PATIENT_EDIT    = "patient/{patientId}/edit"
     const val APPROVAL_QUEUE  = "approval"
     const val AUDIT_LOG       = "auditlog"
     const val CONFIG          = "config"
     const val SUMMARY         = "summary"
-    const val MEDICINE        = "medicine"
     const val SCAN            = "scan"
     const val NOTIFICATIONS   = "notifications"
 
-    fun patientProfile(id: String) = "patient/$id"
+    fun patientProfile(id: String, tab: Int = 0) = "patient/$id?tab=$tab"
     fun patientEdit(id: String)    = "patient/$id/edit"
 }
 
@@ -90,18 +106,33 @@ fun KalazaNavHost(
             approvalRepo    = app.approvalRepository,
             auditRepo       = app.auditRepository,
             staffRepo       = app.staffRepository,
-            allotmentRequestRepo = app.allotmentRequestRepository,
             notificationRepo = app.notificationRepository,
+            syncManager = app.syncManager,
         )
     }
 
     // Logout handler — clears local session, signs out of Supabase Auth
-    // server-side, and navigates back to login
-    val onLogout: () -> Unit = {
-        app.authRepository.logout()
+    // server-side, and navigates back to login. clearPushToken is false only for the
+    // idle auto-logout below (same person/phone, just locked) so that case doesn't
+    // kill their own notifications until they next open the app. Every screen keeps
+    // using the plain onLogout below (an explicit tap always clears the token) —
+    // performLogout is only for the auto-logout timer's own, deliberately different, call.
+    val performLogout: (clearPushToken: Boolean) -> Unit = { clearPushToken ->
+        app.authRepository.logout(clearPushToken)
         SessionManager.logout()
         navController.navigate(Routes.LOGIN) {
             popUpTo(0) { inclusive = true }
+        }
+    }
+    val onLogout: () -> Unit = { performLogout(true) }
+
+    // MainActivity's own gate already tries to repopulate SessionManager from a still-valid
+    // Supabase session before this composes; if that failed (session actually expired, or the
+    // account was revoked while the app was away) but Compose Navigation's saved state still
+    // restored a non-Login route, force back to Login rather than run any screen unauthenticated.
+    LaunchedEffect(currentRoute) {
+        if (currentRoute != null && currentRoute != Routes.LOGIN && !SessionManager.isLoggedIn()) {
+            navController.navigate(Routes.LOGIN) { popUpTo(0) { inclusive = true } }
         }
     }
 
@@ -124,22 +155,75 @@ fun KalazaNavHost(
     // Routes where bottom nav should be visible
     val bottomNavRoutes = setOf(
         Routes.DASHBOARD, Routes.SUPER_ADMIN_OVERVIEW, Routes.TODO_LIST, Routes.APPROVAL_QUEUE,
-        Routes.AUDIT_LOG, Routes.CONFIG, Routes.SUMMARY, Routes.MEDICINE, Routes.SCAN
+        Routes.AUDIT_LOG, Routes.CONFIG, Routes.SUMMARY, Routes.SCAN
     )
     val showBottomNav = currentRoute in bottomNavRoutes
 
+    // ── Offline banner + "saved offline" snackbar ────────────────────────────
+    val isOnline by app.connectivityObserver.isOnline.collectAsState()
+    val pendingSyncCount by app.syncManager.pendingCount.collectAsState()
+    val snackbarHostState = remember { SnackbarHostState() }
+    LaunchedEffect(Unit) {
+        app.syncManager.offlineSavedMessages.collect { message ->
+            snackbarHostState.showSnackbar(message)
+        }
+    }
+
+    // ── Auto-logout after 15 min idle, same for every role ──────────────────
+    // A session persisted on-device indefinitely otherwise; no timeout, no
+    // re-auth prompt — see the security backlog. lastInteractionAt is bumped
+    // by any pointer event anywhere in the app (Initial pass, never consumed,
+    // so it never interferes with normal touch/scroll/click handling) and
+    // checked on a plain poll rather than per-event, since a 15-second
+    // granularity is more than enough for a 15-minute timeout.
+    var lastInteractionAt by remember { mutableLongStateOf(System.currentTimeMillis()) }
+    LaunchedEffect(Unit) {
+        while (true) {
+            delay(AUTO_LOGOUT_POLL_MS)
+            if (SessionManager.isLoggedIn() &&
+                System.currentTimeMillis() - lastInteractionAt >= AUTO_LOGOUT_TIMEOUT_MS
+            ) {
+                performLogout(false)
+                lastInteractionAt = System.currentTimeMillis()
+            }
+        }
+    }
+
     Scaffold(
+        modifier = Modifier.pointerInput(Unit) {
+            awaitPointerEventScope {
+                while (true) {
+                    awaitPointerEvent(PointerEventPass.Initial)
+                    lastInteractionAt = System.currentTimeMillis()
+                }
+            }
+        },
         bottomBar = {
             if (showBottomNav) {
                 KalazaBottomNavBar(navController = navController, currentRoute = currentRoute)
             }
-        }
+        },
+        snackbarHost = { SnackbarHost(snackbarHostState) },
     ) { innerPadding ->
+
+        Column(modifier = Modifier.padding(innerPadding)) {
+            if (currentRoute != Routes.LOGIN && (!isOnline || pendingSyncCount > 0)) {
+                val (bg, label) = when {
+                    !isOnline -> Color(0xFF7A1F1F) to "Offline — showing cached data"
+                    else -> Color(0xFF8A6D1F) to "Syncing $pendingSyncCount pending change${if (pendingSyncCount == 1) "" else "s"}…"
+                }
+                Box(
+                    modifier = Modifier.fillMaxWidth().background(bg).padding(vertical = 6.dp),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Text(label, color = Color.White, fontSize = 13.sp, textAlign = TextAlign.Center)
+                }
+            }
 
         NavHost(
             navController   = navController,
             startDestination = Routes.LOGIN,
-            modifier         = Modifier.padding(innerPadding),
+            modifier         = Modifier.weight(1f),
         ) {
 
             // ── Login ──────────────────────────────────────────────────────────
@@ -214,11 +298,16 @@ fun KalazaNavHost(
             // ── Patient Profile ────────────────────────────────────────────────
             composable(
                 route = Routes.PATIENT_PROFILE,
-                arguments = listOf(navArgument("patientId") { type = NavType.StringType })
+                arguments = listOf(
+                    navArgument("patientId") { type = NavType.StringType },
+                    navArgument("tab") { type = NavType.IntType; defaultValue = 0 },
+                )
             ) { backStack ->
                 val patientId = backStack.arguments?.getString("patientId") ?: ""
+                val initialTab = backStack.arguments?.getInt("tab") ?: 0
                 PatientProfileScreen(
                     patientId = patientId,
+                    initialTab = initialTab,
                     factory = factory,
                     onBack = { navController.popBackStack() },
                     onEditPatient = { navController.navigate(Routes.patientEdit(patientId)) }
@@ -296,19 +385,6 @@ fun KalazaNavHost(
                 )
             }
 
-            // ── Medicine (medicine-staff allotment rounds) ────────────────────────
-            composable(Routes.MEDICINE) {
-                val vm: MedicineViewModel = viewModel(factory = factory)
-                val notificationVm: NotificationViewModel = viewModel(factory = factory)
-                ReloadOnResume { vm.load(); notificationVm.load() }
-                MedicineScreen(
-                    viewModel = vm,
-                    unreadNotifications = notificationVm.unreadCount.collectAsState().value,
-                    onNotificationsClick = { navController.navigate(Routes.NOTIFICATIONS) },
-                    onLogout = onLogout
-                )
-            }
-
             // ── Scan (batch QR administration) ───────────────────────────────────
             composable(Routes.SCAN) {
                 val vm: com.kalazacare.app.ui.ScanViewModel = viewModel(factory = factory)
@@ -336,6 +412,7 @@ fun KalazaNavHost(
                     }
                 )
             }
+        }
         }
     }
 }

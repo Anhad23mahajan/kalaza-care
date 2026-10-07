@@ -10,7 +10,22 @@ import java.time.LocalDate
 interface AuthRepository {
     /** Null on any failure — wrong name, wrong password, or a revoked (inactive) account. */
     suspend fun login(name: String, password: String): Staff?
-    fun logout()
+    /**
+     * Re-derives [Staff] from whatever Supabase Auth session the SDK already restored from
+     * disk (it persists across process death on its own) — used to repopulate [SessionManager]
+     * after the OS kills and restarts the app process while Compose Navigation's own saved
+     * state puts the user back on a non-Login screen. Null if there's no valid session, or the
+     * account was revoked while the app was away — either way the caller should route to Login
+     * rather than let the app run with no identity behind it.
+     */
+    suspend fun restoreSession(): Staff?
+    /**
+     * [clearPushToken] = false for the 15-min idle auto-logout: same person, same phone, just
+     * locked for security — clearing the token there would silently kill their own push
+     * notifications until they next open the app. Only an explicit Logout tap (someone
+     * deliberately leaving, or handing the phone to someone else) should clear it.
+     */
+    fun logout(clearPushToken: Boolean = true)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -56,9 +71,10 @@ interface MedicationRepository {
     suspend fun updateMedication(entry: MedicationEntry)
     suspend fun deleteMedication(id: String)
     suspend fun markAdministered(id: String, staffName: String, scannedCode: String)
-    suspend fun allotMedication(id: String, staffId: String, staffName: String, scannedCode: String)
-    /** The permanent compliance record of allotment/administration QR scans — see [MedicationEvidenceEvent]. */
+    /** The permanent compliance record of administration QR scans — see [MedicationEvidenceEvent]. */
     suspend fun getEvidenceLog(): List<MedicationEvidenceEvent>
+    /** Per-day given/missed outcomes for every dose of this patient — see [MedicationHistoryEntry]. */
+    suspend fun getAdministrationHistory(patientId: String): List<MedicationHistoryEntry>
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -72,6 +88,7 @@ interface UtilityRepository {
     suspend fun getUtilityRecordById(id: String): UtilityRecord?
     suspend fun addUtilityRecord(record: UtilityRecord)
     suspend fun updateUtilityRecord(record: UtilityRecord)
+    suspend fun deleteUtilityRecord(id: String)
     suspend fun getUtilityItems(): List<UtilityItem>
     /** Includes deactivated items too, so historical records referencing them stay readable. */
     suspend fun getAllUtilityItems(): List<UtilityItem>
@@ -114,14 +131,6 @@ interface ApprovalRepository {
     suspend fun submitRequest(request: ApprovalRequest)
 }
 
-interface AllotmentRequestRepository {
-    suspend fun getAllRequests(): List<AllotmentRequest>
-    suspend fun getPendingRequests(): List<AllotmentRequest>
-    suspend fun submitRequest(request: AllotmentRequest)
-    suspend fun fulfillRequest(id: String, staffId: String, staffName: String)
-    suspend fun getByMedicationEntryId(medicationEntryId: String): AllotmentRequest?
-}
-
 interface NotificationRepository {
     suspend fun getForRecipient(staffId: String, role: UserRole): List<AppNotification>
     suspend fun getUnreadCountForRecipient(staffId: String, role: UserRole): Int
@@ -155,4 +164,13 @@ interface StaffRepository {
     suspend fun deleteStaff(id: String)
     /** Called after login and whenever Firebase Messaging rotates this device's token. */
     suspend fun updateFcmToken(staffId: String, token: String)
+    /**
+     * Super-Admin-only: sets [staffId]'s password (their own account included).
+     * Goes through the `admin-reset-password` Edge Function — the client SDK can
+     * only ever change the *currently signed-in* user's own password, so setting
+     * someone else's requires the service-role Auth Admin API, which only an
+     * Edge Function can hold. Throws with a user-facing message on failure
+     * (wrong role, weak password, target not found, etc.).
+     */
+    suspend fun resetPassword(staffId: String, newPassword: String)
 }

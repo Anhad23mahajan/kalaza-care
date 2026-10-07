@@ -7,6 +7,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Inventory2
 import androidx.compose.material3.IconButton
@@ -38,6 +39,7 @@ fun UtilityTable(
     items: List<UtilityItem>,
     modifier: Modifier = Modifier,
     onEdit: (UtilityRecord) -> Unit = {},
+    onDelete: (UtilityRecord) -> Unit = {},
 ) {
     val scrollState = rememberScrollState()
 
@@ -52,11 +54,12 @@ fun UtilityTable(
             verticalAlignment = Alignment.CenterVertically,
         ) {
             HeaderCell("Date", width = 100.dp)
-            HeaderCell("Time", width = 80.dp)
+            HeaderCell("Time", width = 112.dp)
             items.forEach { item -> HeaderCell(item.name, width = 110.dp) }
             HeaderCell("Issued To", width = 120.dp)
             HeaderCell("Issued By", width = 120.dp)
             HeaderCell("Checked By", width = 120.dp)
+            HeaderCell("", width = 56.dp)
             HeaderCell("", width = 56.dp)
         }
 
@@ -83,7 +86,7 @@ fun UtilityTable(
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
                     DataCell(DateUtils.formatDate(record.date), width = 100.dp)
-                    DataCell(DateUtils.formatTime(record.time), width = 80.dp)
+                    DataCell(DateUtils.formatTime(record.time), width = 112.dp)
                     items.forEach { item ->
                         val qty = record.quantities[item.id] ?: 0
                         DataCell(if (qty > 0) qty.toString() else "-", width = 110.dp)
@@ -93,6 +96,9 @@ fun UtilityTable(
                     DataCell(record.checkedBy, width = 120.dp)
                     IconButton(onClick = { onEdit(record) }, modifier = Modifier.width(56.dp)) {
                         Icon(Icons.Filled.Edit, contentDescription = "Edit utility record", tint = KalazaRed)
+                    }
+                    IconButton(onClick = { onDelete(record) }, modifier = Modifier.width(56.dp)) {
+                        Icon(Icons.Filled.Delete, contentDescription = "Delete utility record", tint = MaterialTheme.colorScheme.error)
                     }
                 }
             }

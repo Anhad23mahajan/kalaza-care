@@ -11,6 +11,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Archive
 import androidx.compose.material.icons.filled.CalendarMonth
 import androidx.compose.material.icons.filled.Edit
@@ -28,16 +29,19 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import com.kalazacare.app.ui.*
 import com.kalazacare.app.ui.components.ConfirmDialog
 import com.kalazacare.app.ui.components.KalazaTopBar
-import com.kalazacare.app.ui.components.QrScanDialog
 import com.kalazacare.app.ui.components.label
 import com.kalazacare.app.ui.components.matches
 import com.kalazacare.app.ui.mar.MarTable
+import com.kalazacare.app.ui.mar.MedicationHistoryTable
+import com.kalazacare.app.ui.components.QrScanDialog
+import androidx.compose.material3.TabRowDefaults.tabIndicatorOffset
 import com.kalazacare.app.ui.theme.KalazaRed
 import com.kalazacare.app.ui.theme.White
 import com.kalazacare.app.ui.utility.UtilityTable
 import com.kalazacare.app.ui.vitals.VitalsTable
 import com.kalazacare.app.util.DateUtils
 import com.kalazacare.app.util.SessionManager
+import com.kalazacare.app.util.toInitials
 import kotlinx.coroutines.launch
 import java.time.format.DateTimeFormatter
 import androidx.compose.material3.TabRowDefaults.tabIndicatorOffset
@@ -51,6 +55,7 @@ import androidx.compose.foundation.ExperimentalFoundationApi
 @Composable
 fun PatientProfileScreen(
     patientId: String,
+    initialTab: Int = 0,
     factory: KalazaViewModelFactory,
     onBack: () -> Unit,
     onEditPatient: () -> Unit,
@@ -83,7 +88,10 @@ fun PatientProfileScreen(
     }
 
     val tabs = listOf("Info", "Vitals", "Med", "Utilities", "Visits", "Notes")
-    val pagerState = rememberPagerState(pageCount = { tabs.size })
+    val pagerState = rememberPagerState(
+        initialPage = initialTab.coerceIn(0, tabs.size - 1),
+        pageCount = { tabs.size },
+    )
     val coroutineScope = rememberCoroutineScope()
 
     val p = patient
@@ -101,7 +109,12 @@ fun PatientProfileScreen(
                         Icon(
                             imageVector = Icons.Default.Edit,
                             contentDescription = "Edit Patient",
-                            tint = KalazaRed
+                            // Was tinted KalazaRed — identical to the top bar's own
+                            // background color, so the icon was fully invisible even
+                            // though it was there and tappable the whole time. Every
+                            // other icon in this bar (edit's own sibling MoreVert
+                            // included) uses White; this one just never matched.
+                            tint = White
                         )
                     }
                     if (SessionManager.isAdmin() && p != null) {
@@ -309,7 +322,7 @@ private fun PatientHeaderCard(patient: com.kalazacare.app.data.model.Patient) {
                 contentAlignment = Alignment.Center
             ) {
                 Text(
-                    text = patient.name.take(1).uppercase(),
+                    text = patient.name.toInitials(),
                     style = MaterialTheme.typography.headlineMedium,
                     color = KalazaRed,
                     fontWeight = FontWeight.Bold,
@@ -438,7 +451,7 @@ private fun VitalsTabContent(
             containerColor = KalazaRed,
             contentColor = MaterialTheme.colorScheme.onPrimary,
         ) {
-            Icon(Icons.Default.Edit, "Add Vital")
+            Icon(Icons.Default.Add, "Add Vital")
         }
     }
 
@@ -604,33 +617,82 @@ private fun MarTabContent(
     marVm: MarViewModel,
 ) {
     var showAddDialog by remember { mutableStateOf(false) }
-    var administerTargetId by remember { mutableStateOf<String?>(null) }
+    var adminMarkTarget by remember { mutableStateOf<com.kalazacare.app.data.model.MedicationEntry?>(null) }
+    var selectedTabIndex by remember { mutableStateOf(0) }
+    val tabs = listOf("Today", "History")
+    val history by marVm.history.collectAsState()
     val context = androidx.compose.ui.platform.LocalContext.current
 
-    Box(modifier = Modifier.fillMaxSize()) {
-        MarTable(
-            medications = medications,
-            onMarkAdministered = { id -> administerTargetId = id },
-            onRequestAllotment = { entry ->
-                marVm.requestAllotment(entry) { message ->
-                    Toast.makeText(context, message, Toast.LENGTH_LONG).show()
-                }
-            },
-            onEditMedication   = { updated -> marVm.updateMedication(updated) },
-            onDeleteMedication = { entry -> marVm.deleteMedication(entry) },
-        )
+    LaunchedEffect(selectedTabIndex, patientId) {
+        if (selectedTabIndex == 1) marVm.loadHistory(patientId)
+    }
 
-        // Only Admin can add medications
-        if (SessionManager.isAdmin()) {
-            FloatingActionButton(
-                onClick = { showAddDialog = true },
-                modifier = Modifier
-                    .align(Alignment.BottomEnd)
-                    .padding(16.dp),
-                containerColor = KalazaRed,
-                contentColor = MaterialTheme.colorScheme.onPrimary,
-            ) {
-                Icon(Icons.Default.Edit, "Add Medication")
+    Column(modifier = Modifier.fillMaxSize()) {
+        TabRow(
+            selectedTabIndex = selectedTabIndex,
+            containerColor = MaterialTheme.colorScheme.surface,
+            contentColor = KalazaRed,
+            indicator = { tabPositions ->
+                TabRowDefaults.SecondaryIndicator(
+                    Modifier.tabIndicatorOffset(tabPositions[selectedTabIndex]),
+                    color = KalazaRed,
+                    height = 3.dp
+                )
+            }
+        ) {
+            tabs.forEachIndexed { index, title ->
+                Tab(
+                    selected = selectedTabIndex == index,
+                    onClick = { selectedTabIndex = index },
+                    text = {
+                        Text(
+                            text = title,
+                            fontWeight = if (selectedTabIndex == index) FontWeight.Bold else FontWeight.Normal
+                        )
+                    },
+                    selectedContentColor = KalazaRed,
+                    unselectedContentColor = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+        }
+
+        Box(modifier = Modifier.weight(1f)) {
+            if (selectedTabIndex == 0) {
+                MarTable(
+                    medications = medications,
+                    onEditMedication   = { updated ->
+                        val original = medications.firstOrNull { it.id == updated.id }
+                        if (original != null) {
+                            marVm.requestEditMedication(original, updated) { _, message ->
+                                Toast.makeText(context, message, Toast.LENGTH_LONG).show()
+                            }
+                        }
+                    },
+                    onDeleteMedication = { entry ->
+                        marVm.requestDeleteMedication(entry) { _, message ->
+                            Toast.makeText(context, message, Toast.LENGTH_LONG).show()
+                        }
+                    },
+                    onMarkAdministeredAsAdmin = if (SessionManager.isAdmin()) {
+                        { entry -> adminMarkTarget = entry }
+                    } else null,
+                )
+
+                // Super Admin adds directly; Supervisor can too, but it goes through approval.
+                if (SessionManager.isAdmin() || SessionManager.isSupervisor()) {
+                    FloatingActionButton(
+                        onClick = { showAddDialog = true },
+                        modifier = Modifier
+                            .align(Alignment.BottomEnd)
+                            .padding(16.dp),
+                        containerColor = KalazaRed,
+                        contentColor = MaterialTheme.colorScheme.onPrimary,
+                    ) {
+                        Icon(Icons.Default.Add, "Add Medication")
+                    }
+                }
+            } else {
+                MedicationHistoryTable(entries = history, modifier = Modifier.fillMaxSize())
             }
         }
     }
@@ -648,17 +710,15 @@ private fun MarTabContent(
         )
     }
 
-    administerTargetId?.let { id ->
+    adminMarkTarget?.let { entry ->
         QrScanDialog(
-            title = "Confirm Medication Given",
-            message = "Scan the patient's bedside QR code to confirm the dose was given.",
+            title = "Mark ${entry.medicineName} Given",
+            message = "Admin override — this dose is outside the normal 1-hour window. Scan the QR code if available, or confirm manually.",
             onConfirm = { scannedCode ->
-                marVm.markAdministered(id, scannedCode) { error ->
-                    if (error != null) Toast.makeText(context, error, Toast.LENGTH_LONG).show()
-                }
-                administerTargetId = null
+                marVm.markAdministeredAsAdmin(entry, scannedCode)
+                adminMarkTarget = null
             },
-            onDismiss = { administerTargetId = null }
+            onDismiss = { adminMarkTarget = null }
         )
     }
 }
@@ -835,6 +895,7 @@ private fun UtilityTabContent(
 ) {
     var showAddDialog by remember { mutableStateOf(false) }
     var editTarget by remember { mutableStateOf<com.kalazacare.app.data.model.UtilityRecord?>(null) }
+    var deleteTarget by remember { mutableStateOf<com.kalazacare.app.data.model.UtilityRecord?>(null) }
     val context = androidx.compose.ui.platform.LocalContext.current
 
     // Columns: every active item, plus any deactivated item that still has logged
@@ -845,7 +906,7 @@ private fun UtilityTabContent(
     }
 
     Box(modifier = Modifier.fillMaxSize()) {
-        UtilityTable(records = records, items = tableColumns, onEdit = { editTarget = it })
+        UtilityTable(records = records, items = tableColumns, onEdit = { editTarget = it }, onDelete = { deleteTarget = it })
 
         FloatingActionButton(
             onClick = { showAddDialog = true },
@@ -855,7 +916,7 @@ private fun UtilityTabContent(
             containerColor = KalazaRed,
             contentColor = MaterialTheme.colorScheme.onPrimary,
         ) {
-            Icon(Icons.Default.Edit, "Add Utility Record")
+            Icon(Icons.Default.Add, "Add Utility Record")
         }
     }
 
@@ -881,6 +942,22 @@ private fun UtilityTabContent(
                 }
                 editTarget = null
             }
+        )
+    }
+
+    deleteTarget?.let { record ->
+        ConfirmDialog(
+            title = "Delete Utility Record",
+            message = "Delete this utility record? This cannot be undone.",
+            confirmText = "Delete",
+            isDestructive = true,
+            onConfirm = {
+                utilityVm.requestDelete(record) { _, message ->
+                    Toast.makeText(context, message, Toast.LENGTH_LONG).show()
+                }
+                deleteTarget = null
+            },
+            onDismiss = { deleteTarget = null }
         )
     }
 }
@@ -967,7 +1044,7 @@ private fun AddUtilityDialog(
                             quantities = quantities.mapValues { it.value.toIntOrNull() ?: 0 }
                                 .filterValues { it > 0 },
                             issuedToCaregiver = SessionManager.getCurrentStaffName(),
-                            issuedBySupervisor = if (SessionManager.isAdmin()) SessionManager.getCurrentStaffName() else "",
+                            issuedBySupervisor = if (SessionManager.isAdmin() || SessionManager.isSupervisor()) SessionManager.getCurrentStaffName() else "",
                         )
                     )
                 },

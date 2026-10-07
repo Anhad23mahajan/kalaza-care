@@ -13,7 +13,6 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
-import com.kalazacare.app.data.model.AllotmentStatus
 import com.kalazacare.app.data.model.MedStatus
 import com.kalazacare.app.data.model.MedicationEntry
 import com.kalazacare.app.ui.components.ConfirmDialog
@@ -26,6 +25,7 @@ import com.kalazacare.app.ui.components.matches
 import com.kalazacare.app.ui.theme.KalazaRed
 import com.kalazacare.app.ui.theme.OnSurface
 import com.kalazacare.app.ui.theme.OnSurfaceVariant
+import com.kalazacare.app.ui.theme.StatusSuccess
 import com.kalazacare.app.ui.theme.White
 import com.kalazacare.app.util.DateUtils
 import com.kalazacare.app.util.SessionManager
@@ -33,10 +33,12 @@ import com.kalazacare.app.util.SessionManager
 @Composable
 fun MarTable(
     medications: List<MedicationEntry>,
-    onMarkAdministered: (String) -> Unit,
-    onRequestAllotment: (MedicationEntry) -> Unit = {},
     onEditMedication: ((MedicationEntry) -> Unit)? = null,   // CHANGE 5
     onDeleteMedication: ((MedicationEntry) -> Unit)? = null,
+    // Super-Admin-only override: the Scan tab is the normal way to mark a dose given, gated
+    // to a ±30min window around the scheduled time, but a genuinely missed dose still needs
+    // correcting after the fact — null for every other role, which hides the button entirely.
+    onMarkAdministeredAsAdmin: ((MedicationEntry) -> Unit)? = null,
     modifier: Modifier = Modifier
 ) {
     var editTarget by remember { mutableStateOf<MedicationEntry?>(null) }
@@ -54,7 +56,8 @@ fun MarTable(
 
     LazyColumn(
         modifier = modifier.fillMaxSize(),
-        contentPadding = PaddingValues(16.dp),
+        // Extra bottom space so the Add button never covers the last card's actions.
+        contentPadding = PaddingValues(start = 16.dp, top = 16.dp, end = 16.dp, bottom = 96.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
         items(medications) { entry ->
@@ -72,8 +75,10 @@ fun MarTable(
                             Text(entry.medicineName, style = MaterialTheme.typography.titleMedium,
                                 color = OnSurface, fontWeight = FontWeight.Bold,
                                 modifier = Modifier.weight(1f))
-                            // Add/edit/delete of MAR entries is SuperAdmin-only
-                            if (SessionManager.isAdmin()) {
+                            // Super Admin edits/deletes directly; Supervisor can too, but it always
+                            // goes through Super Admin approval first (see MarViewModel.requestEditMedication/
+                            // requestDeleteMedication). Staff has no access at all.
+                            if (SessionManager.isAdmin() || SessionManager.isSupervisor()) {
                                 IconButton(
                                     onClick = { editTarget = entry },
                                     modifier = Modifier.size(32.dp)
@@ -102,28 +107,11 @@ fun MarTable(
                         }
                         if (entry.status == MedStatus.ADMINISTERED && entry.administeredAt != null) {
                             Spacer(Modifier.height(4.dp))
+                            // StatusSuccess, not colorScheme.primary (the app's brand red) --
+                            // same fix as MedicationHistoryTable's Given/Missed colors.
                             Text("Administered by ${entry.administeredBy} at ${DateUtils.formatTime(entry.administeredAt.toLocalTime())}",
                                 style = MaterialTheme.typography.labelSmall,
-                                color = MaterialTheme.colorScheme.primary)
-                        }
-                        Spacer(Modifier.height(4.dp))
-                        Text(
-                            text = if (entry.allotmentStatus == AllotmentStatus.ALLOTTED)
-                                "Allotted by ${entry.allottedByName}"
-                            else "Not allotted yet",
-                            style = MaterialTheme.typography.labelSmall,
-                            color = if (entry.allotmentStatus == AllotmentStatus.ALLOTTED)
-                                MaterialTheme.colorScheme.primary
-                            else MaterialTheme.colorScheme.error
-                        )
-                        if (entry.allotmentStatus == AllotmentStatus.NOT_ALLOTTED && entry.status != MedStatus.ADMINISTERED) {
-                            TextButton(
-                                onClick = { onRequestAllotment(entry) },
-                                contentPadding = PaddingValues(horizontal = 0.dp, vertical = 2.dp)
-                            ) {
-                                Text("Request Allotment", color = KalazaRed,
-                                    style = MaterialTheme.typography.labelSmall)
-                            }
+                                color = StatusSuccess)
                         }
                     }
 
@@ -131,12 +119,16 @@ fun MarTable(
 
                     Column(horizontalAlignment = Alignment.End) {
                         MedStatusBadge(status = entry.status)
-                        if (entry.status == MedStatus.PENDING || entry.status == MedStatus.OVERDUE) {
+                        if (onMarkAdministeredAsAdmin != null &&
+                            (entry.status == MedStatus.PENDING || entry.status == MedStatus.OVERDUE)
+                        ) {
                             Spacer(Modifier.height(8.dp))
-                            Button(
-                                onClick = { onMarkAdministered(entry.id) },
-                                contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
-                            ) { Text("Mark Given") }
+                            TextButton(
+                                onClick = { onMarkAdministeredAsAdmin(entry) },
+                                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp)
+                            ) {
+                                Text("Mark Given", color = KalazaRed, style = MaterialTheme.typography.labelSmall)
+                            }
                         }
                     }
                 }
@@ -157,11 +149,16 @@ fun MarTable(
     }
 
     deleteTarget?.let { entry ->
+        // A Supervisor's delete only submits a request for Super Admin approval — don't claim it's final.
+        val isDirectDelete = SessionManager.isAdmin()
         ConfirmDialog(
-            title = "Delete Medication",
-            message = "Delete ${entry.medicineName} (${entry.dose}) from this patient's MAR? This cannot be undone.",
-            confirmText = "Delete",
-            isDestructive = true,
+            title = if (isDirectDelete) "Delete Medication" else "Request Deletion",
+            message = if (isDirectDelete)
+                "Delete ${entry.medicineName} (${entry.dose}) from this patient's Med tab? This cannot be undone."
+            else
+                "Ask a Super Admin to delete ${entry.medicineName} (${entry.dose})? It stays on the Med tab until they approve.",
+            confirmText = if (isDirectDelete) "Delete" else "Send Request",
+            isDestructive = isDirectDelete,
             onConfirm = {
                 onDeleteMedication?.invoke(entry)
                 deleteTarget = null

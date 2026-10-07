@@ -41,9 +41,10 @@ fun ApprovalStatusBadge(status: ApprovalStatus) {
 @Composable
 fun MedStatusBadge(status: MedStatus) {
     when (status) {
-        MedStatus.ADMINISTERED -> StatusBadge("Given ✓",  Color(0xFFD4EDDA), Color(0xFF155724))
-        MedStatus.PENDING      -> StatusBadge("Pending",  Color(0xFFFFF3CD), Color(0xFF856404))
-        MedStatus.OVERDUE      -> StatusBadge("Overdue!", Color(0xFFF8D7DA), Color(0xFF721C24))
+        // Solid fills (not pastel tints) so Given/Missed are unmistakable at a glance.
+        MedStatus.ADMINISTERED -> StatusBadge("Given ✓", Color(0xFF1E8E3E), White)
+        MedStatus.PENDING      -> StatusBadge("Pending", Color(0xFFFFF3CD), Color(0xFF856404))
+        MedStatus.OVERDUE      -> StatusBadge("Missed",  StatusError, White)
     }
 }
 
@@ -51,6 +52,7 @@ fun MedStatusBadge(status: MedStatus) {
 fun RoleBadge(role: UserRole) {
     when (role) {
         UserRole.SUPER_ADMIN    -> StatusBadge(role.displayLabel(), KalazaRed, White)
+        UserRole.ADMIN          -> StatusBadge(role.displayLabel(), Color(0xFFF8D7DA), Color(0xFF721C24))
         UserRole.SUPERVISOR     -> StatusBadge(role.displayLabel(), Color(0xFFD1E7DD), Color(0xFF0F5132))
         UserRole.STAFF          -> StatusBadge(role.displayLabel(), SurfaceVariant, OnSurfaceVariant)
     }

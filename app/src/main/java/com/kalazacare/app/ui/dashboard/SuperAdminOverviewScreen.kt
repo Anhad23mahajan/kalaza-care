@@ -25,7 +25,7 @@ import com.kalazacare.app.util.DateUtils
 /**
  * Super Admin's landing screen after login — a single, information-dense view of today: key
  * numbers, what's outstanding across medications/vitals/utilities/doctor visits (grouped by
- * category or by patient), and the pending approval/allotment requests that actually need a
+ * category or by patient), and the pending approval requests that actually need a
  * decision. The full patient list, weekly report, and utility-item configuration all still live
  * in their own screens (Patients, Summary, Config on the bottom nav) — this screen is
  * deliberately just "today", not a hub for everything.
@@ -39,10 +39,10 @@ fun SuperAdminOverviewScreen(
 ) {
     val totalPatients by dashboardViewModel.totalPatients.collectAsState()
     val pendingMedsCount by dashboardViewModel.pendingMeds.collectAsState()
+    val missedMedsCount by dashboardViewModel.missedMeds.collectAsState()
     val pendingApprovalsCount by dashboardViewModel.pendingApprovals.collectAsState()
     val patientSummaries by dailySummaryViewModel.patientSummaries.collectAsState()
     val pendingApprovals by dailySummaryViewModel.pendingApprovals.collectAsState()
-    val pendingAllotments by dailySummaryViewModel.pendingAllotments.collectAsState()
     val isLoading by dailySummaryViewModel.isLoading.collectAsState()
 
     var groupByPatient by remember { mutableStateOf(false) }
@@ -61,12 +61,19 @@ fun SuperAdminOverviewScreen(
                 Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                     OverviewStatCard(modifier = Modifier.weight(1f), title = "Total Patients", value = totalPatients.toString())
                     OverviewStatCard(
+                        modifier = Modifier.weight(1f), title = "Pending Approvals", value = pendingApprovalsCount.toString(),
+                        isAlert = pendingApprovalsCount > 0,
+                    )
+                }
+                Spacer(modifier = Modifier.height(12.dp))
+                Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                    OverviewStatCard(
                         modifier = Modifier.weight(1f), title = "Pending Meds", value = pendingMedsCount.toString(),
                         isAlert = pendingMedsCount > 0,
                     )
                     OverviewStatCard(
-                        modifier = Modifier.weight(1f), title = "Pending Approvals", value = pendingApprovalsCount.toString(),
-                        isAlert = pendingApprovalsCount > 0,
+                        modifier = Modifier.weight(1f), title = "Missed Meds", value = missedMedsCount.toString(),
+                        isAlert = missedMedsCount > 0,
                     )
                 }
             }
@@ -81,7 +88,7 @@ fun SuperAdminOverviewScreen(
                     contentPadding = PaddingValues(start = 16.dp, end = 16.dp, bottom = 24.dp),
                     verticalArrangement = Arrangement.spacedBy(12.dp),
                 ) {
-                    if (pendingApprovals.isNotEmpty() || pendingAllotments.isNotEmpty()) {
+                    if (pendingApprovals.isNotEmpty()) {
                         item {
                             Text(
                                 text = "Needs Your Attention",
@@ -99,16 +106,6 @@ fun SuperAdminOverviewScreen(
                             }
                         }
                     }
-                    if (pendingAllotments.isNotEmpty()) {
-                        item {
-                            CategorySection(title = "Allotment Requests", done = 0, total = pendingAllotments.size, alwaysExpandable = true) {
-                                pendingAllotments.forEach { req ->
-                                    RemainingRow("${req.patientName}: ${req.medicineName} (${DateUtils.formatTime(req.scheduledTime)}) — requested by ${req.requestedByName}")
-                                }
-                            }
-                        }
-                    }
-
                     item {
                         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                             Text(

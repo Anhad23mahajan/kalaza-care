@@ -12,11 +12,17 @@ import java.time.LocalTime
 // CHANGE 9: ADMIN → SUPER_ADMIN (keeps all prior admin powers). The restricted,
 // photo-audit-only ADMIN role added alongside that rename was later removed
 // entirely (photo evidence was replaced by QR-scan evidence, and the role had
-// no other purpose) — only three roles remain.
-enum class UserRole { SUPER_ADMIN, STAFF, SUPERVISOR }
+// no other purpose) — only three roles remained.
+// ADMIN is back with a different meaning: same privileges as SUPER_ADMIN, but created
+// (and removable) only by the Super Admin, who themself can never be removed.
+enum class UserRole { SUPER_ADMIN, ADMIN, STAFF, SUPERVISOR }
+
+/** Notifications addressed to SUPER_ADMIN are also for Admins (mirrors current_staff_role() in the DB). */
+fun UserRole.notificationRole(): UserRole = if (this == UserRole.ADMIN) UserRole.SUPER_ADMIN else this
 
 fun UserRole.displayLabel(): String = when (this) {
     UserRole.SUPER_ADMIN -> "Super Admin"
+    UserRole.ADMIN       -> "Admin"
     UserRole.STAFF       -> "Regular Staff"
     UserRole.SUPERVISOR  -> "Supervisor"
 }
@@ -26,16 +32,39 @@ enum class Gender { MALE, FEMALE, OTHER }
 enum class ApprovalStatus { PENDING, APPROVED, REJECTED }
 
 /** What kind of record an [ApprovalRequest] applies its diff to once approved. */
-enum class ApprovalEntityType { PATIENT, DOCTOR_VISIT, VITAL, UTILITY, CARE_NOTE }
+enum class ApprovalEntityType { PATIENT, DOCTOR_VISIT, VITAL, UTILITY, CARE_NOTE, MEDICATION }
 
-/** What an [ApprovalRequest] is asking for — a field edit, or removing the whole record. */
-enum class ApprovalAction { EDIT, DELETE }
+/** Which PatientProfileScreen tab (Info=0, Vitals=1, Med=2, Utilities=3, Visits=4, Notes=5) a change to this entity belongs on — used so a notification about it deep-links straight there instead of always landing on Info. */
+fun ApprovalEntityType.profileTabIndex(): Int = when (this) {
+    ApprovalEntityType.PATIENT -> 0
+    ApprovalEntityType.VITAL -> 1
+    ApprovalEntityType.MEDICATION -> 2
+    ApprovalEntityType.UTILITY -> 3
+    ApprovalEntityType.DOCTOR_VISIT -> 4
+    ApprovalEntityType.CARE_NOTE -> 5
+}
+
+/** Human-readable label for notification titles, e.g. "Vitals Edit Request". */
+fun ApprovalEntityType.displayLabel(): String = when (this) {
+    ApprovalEntityType.PATIENT -> "Patient"
+    ApprovalEntityType.VITAL -> "Vitals"
+    ApprovalEntityType.UTILITY -> "Utility"
+    ApprovalEntityType.DOCTOR_VISIT -> "Doctor Visit"
+    ApprovalEntityType.CARE_NOTE -> "Care Note"
+    ApprovalEntityType.MEDICATION -> "Medicine"
+}
+
+/**
+ * What an [ApprovalRequest] is asking for. Unlike the other entity types (whose
+ * records are always created directly, approval only gates edit/delete), Medicine
+ * additions from a Supervisor also require Super Admin approval — hence ADD.
+ */
+enum class ApprovalAction { ADD, EDIT, DELETE }
 
 enum class MedStatus { PENDING, ADMINISTERED, OVERDUE }
 
-enum class AllotmentStatus { NOT_ALLOTTED, ALLOTTED }
-
-enum class AllotmentRequestStatus { PENDING, FULFILLED }
+/** A dose can be given from its scheduled time until this many minutes after; past that it's Missed (OVERDUE). */
+const val DOSE_WINDOW_MINUTES = 60
 
 /**
  * Coarse dosing bucket a medication is assigned to, independent of its exact
@@ -45,6 +74,13 @@ enum class AllotmentRequestStatus { PENDING, FULFILLED }
  * tagged with the matching bucket.
  */
 enum class DoseTag { MORNING, AFTERNOON, EVENING }
+
+/**
+ * One calendar day's outcome for one [MedicationEntry], as opposed to
+ * [MedStatus] which is a live view of *today's* schedule that resets daily
+ * for a recurring dose. Backs the Med tab's History table.
+ */
+enum class AdministrationOutcome { ADMINISTERED, MISSED }
 
 // CHANGE 4: visits get an isConfirmed + isArchived flag
 // ─────────────────────────────────────────────────────────────────────────────
@@ -129,29 +165,29 @@ data class MedicationEntry(
     val administeredBy: String = "",
     val administeredAt: LocalDateTime? = null,
     val notes: String = "",
-    val allotmentStatus: AllotmentStatus = AllotmentStatus.NOT_ALLOTTED,
-    val allottedById: String = "",
-    val allottedByName: String = "",
-    val allottedAt: LocalDateTime? = null,
-    val allotmentScannedCode: String = "",
     val administeredScannedCode: String = "",
+    // When the entry was created (server-set). A dose created after its window already closed today
+    // isn't counted Missed for that same day — see MedicationEntry.withComputedStatus.
+    val createdAt: LocalDateTime? = null,
 )
 
-data class AllotmentRequest(
+/**
+ * One row of the per-day medication history table (Med tab → History). Denormalizes
+ * medicineName/dose/tag at write time — same reasoning as [MedicationEvidenceEvent] —
+ * so history stays readable even if the live [MedicationEntry] is later edited or deleted.
+ */
+data class MedicationHistoryEntry(
     val id: String = "",
-    val medicationEntryId: String = "",
+    val medicationId: String = "",
     val patientId: String = "",
-    val patientName: String = "",
     val medicineName: String = "",
-    val dose: String = "",           // added so card can show dose
-    val scheduledTime: LocalTime = LocalTime.now(),
-    val requestedById: String = "",
-    val requestedByName: String = "",
-    val status: AllotmentRequestStatus = AllotmentRequestStatus.PENDING,
-    val fulfilledById: String = "",
-    val fulfilledByName: String = "",
-    val timestamp: LocalDateTime = LocalDateTime.now(),
-    val fulfilledAt: LocalDateTime? = null,
+    val dose: String = "",
+    val tag: DoseTag = DoseTag.MORNING,
+    val date: LocalDate = LocalDate.now(),
+    val status: AdministrationOutcome = AdministrationOutcome.MISSED,
+    val administeredBy: String = "",
+    val administeredAt: LocalDateTime? = null,
+    val scannedCode: String = "",
 )
 
 data class UtilityRecord(
@@ -214,12 +250,29 @@ data class ApprovalRequest(
 )
 
 /**
- * A permanent, append-only record of one allotment/administration QR-scan
- * event — separate from [MedicationEntry]'s own allotment/administered
- * fields, which are a *live* view that resets daily for recurring doses
- * (see MedicationRepository.withComputedStatus), so a dose resetting to
- * PENDING the next day doesn't erase yesterday's evidence from the
- * compliance record.
+ * The full new entry for an [ApprovalAction.ADD] request on [ApprovalEntityType.MEDICATION] —
+ * unlike an edit/delete, there's no existing record to diff a single field against, so the whole
+ * draft medication is serialized into [ApprovalRequest.newValue] and decoded back on approval.
+ */
+@kotlinx.serialization.Serializable
+data class NewMedicationPayload(
+    val medicineName: String = "",
+    val dose: String = "",
+    val quantity: String = "",
+    val scheduleTime: String = "",   // ISO LocalTime
+    val tag: String = "",            // DoseTag name
+    val scheduledDate: String = "",  // ISO LocalDate
+    val isRecurring: Boolean = true,
+    val recurringDays: String = "",  // CSV of ISO day-of-week ints, empty = every day
+    val notes: String = "",
+)
+
+/**
+ * A permanent, append-only record of one administration QR-scan event —
+ * separate from [MedicationEntry]'s own `status`/`administeredAt` fields,
+ * which are a *live* view that resets daily for recurring doses (see
+ * MedicationRepository.withComputedStatus), so a dose resetting to PENDING
+ * the next day doesn't erase yesterday's evidence from the compliance record.
  */
 data class MedicationEvidenceEvent(
     val id: String = "",

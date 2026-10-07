@@ -98,7 +98,7 @@ Deno.serve(async (req) => {
     const { data } = await supabase
       .from("staff")
       .select("fcm_token")
-      .eq("role", record.recipient_role)
+      .in("role", record.recipient_role === "SUPER_ADMIN" ? ["SUPER_ADMIN", "ADMIN"] : [record.recipient_role])
       .eq("is_active", true);
     tokens = (data ?? []).map((r) => r.fcm_token).filter((t): t is string => !!t);
   }
@@ -138,7 +138,17 @@ Deno.serve(async (req) => {
         },
       }),
     });
-    if (res.ok) sent++;
+    if (res.ok) {
+      sent++;
+    } else {
+      // FCM says this token is dead (app uninstalled / token rotated): clear it so we
+      // stop retrying it and the failure is visible in the function logs.
+      const body = await res.text();
+      console.error(`FCM send failed (${res.status}): ${body}`);
+      if (res.status === 404 || body.includes("UNREGISTERED")) {
+        await supabase.from("staff").update({ fcm_token: "" }).eq("fcm_token", token);
+      }
+    }
   }
 
   return new Response(JSON.stringify({ sent, total: tokens.length }), { status: 200 });

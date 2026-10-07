@@ -206,11 +206,34 @@ private fun ScanEntry(
 }
 
 /** Why a dose can't be checked off right now — drives both its visual state and whether it's selectable. */
-private enum class DoseEligibility { GIVEN, NOT_YET_DUE, DUE }
+private enum class DoseEligibility { GIVEN, NOT_YET_DUE, DUE, WINDOW_CLOSED }
 
+/** A dose can be marked given from its scheduled time until this many minutes after it. */
+private const val ADMIN_WINDOW_MINUTES = com.kalazacare.app.data.model.DOSE_WINDOW_MINUTES
+
+/**
+ * Signed distance from [scheduleTime] to [now] in minutes, shortest way around the clock —
+ * a plain LocalTime subtraction breaks for a dose scheduled near midnight (e.g. an 11:50pm
+ * Evening dose whose window end, 00:50, would otherwise look like it's *before*
+ * 11:50pm instead of 60 minutes after it).
+ */
+private fun MedicationEntry.minutesFromDue(now: LocalTime): Int {
+    val dueMin = scheduleTime.hour * 60 + scheduleTime.minute
+    val nowMin = now.hour * 60 + now.minute
+    var diff = nowMin - dueMin
+    if (diff > 720) diff -= 1440 else if (diff < -720) diff += 1440
+    return diff
+}
+
+/**
+ * A dose can only be marked given from its scheduled time until [ADMIN_WINDOW_MINUTES]
+ * after it (e.g. 8:00–9:00) — before that it's not due yet, after it it's locked entirely
+ * until its next occurrence (tomorrow, for a recurring dose) opens its own window.
+ */
 private fun MedicationEntry.eligibility(now: LocalTime): DoseEligibility = when {
     status == MedStatus.ADMINISTERED -> DoseEligibility.GIVEN
-    now.isBefore(scheduleTime) -> DoseEligibility.NOT_YET_DUE
+    minutesFromDue(now) < 0 -> DoseEligibility.NOT_YET_DUE
+    minutesFromDue(now) > ADMIN_WINDOW_MINUTES -> DoseEligibility.WINDOW_CLOSED
     else -> DoseEligibility.DUE
 }
 
@@ -289,6 +312,9 @@ private fun MatchedMedsList(
                                 DoseEligibility.GIVEN -> MedStatusBadge(status = entry.status)
                                 DoseEligibility.NOT_YET_DUE -> Text(
                                     "Not due yet", style = MaterialTheme.typography.labelSmall, color = Color.Gray,
+                                )
+                                DoseEligibility.WINDOW_CLOSED -> Text(
+                                    "Window closed", style = MaterialTheme.typography.labelSmall, color = Color.Gray,
                                 )
                                 DoseEligibility.DUE -> {}
                             }
